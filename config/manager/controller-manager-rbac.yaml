@@ -200,9 +200,39 @@ rules:
   # No update/delete — the RoleBinding is owned by the namespace
   # lifecycle, not by individual SwiftGuests; deleting all SwiftGuests
   # in a namespace doesn't remove the binding.
+  # core ServiceAccounts — the controller creates the per-namespace launcher
+  # SAs (kubeswift-launcher / kubeswift-sandbox-launcher) so a launcher pod no
+  # longer runs as the namespace `default` SA (#443). list+watch are REQUIRED,
+  # not optional: controller-runtime's cached client opens an informer per
+  # GETable type and blocks indefinitely without them — the same trap as W7
+  # (rolebindings) and W8 (storageclasses).
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    verbs: ["get", "list", "watch", "create"]
+    # `delete` is for the #515 narrowing only: retiring the shared
+    # namespace-wide launcher binding once per-pod grants exist. Scoped
+    # Roles/RoleBindings are reaped by ownerReference GC, not by us.
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # rbac.authorization.k8s.io Roles — the per-launcher-pod scoped grant (#515):
+  # a Role naming exactly one pod in resourceNames, owned by the workload CR.
+  #
+  # NO `escalate` verb, deliberately. Kubernetes forbids creating a Role that
+  # grants more than the creator holds, and the security review removed
+  # `escalate` from this ClusterRole on purpose. That constraint is satisfied
+  # WITHOUT it because the controller already holds everything the scoped Role
+  # grants — pods get/patch and swiftguests/status get/patch. If a future rule
+  # widens the scoped Role beyond what the controller holds, Role creation
+  # starts failing with a 403 rather than silently escalating, which is the
+  # correct outcome.
+  #
+  # list+watch are REQUIRED, not optional: controller-runtime's cached client
+  # opens an informer per GETable type and blocks indefinitely without them —
+  # the same trap as W7 (rolebindings) and W8 (storageclasses).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["get", "list", "watch", "create", "update"]
   # cert-manager.io Certificates — the Phase 3c migrationcert controller
   # (--migration-mtls-enabled) creates one per-node leaf Certificate
   # (SAN=nodeName, Option B) and deletes stale ones. list+watch are

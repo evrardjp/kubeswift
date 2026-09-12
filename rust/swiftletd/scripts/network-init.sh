@@ -41,9 +41,25 @@ guest_run_dir() {
 # Node public IPs are NOT blocked (same exposure as any pod); documented.
 apply_restricted_egress() {
     src_net="$1"
+    guest_if="${2:-br0}"
     [ "${KUBESWIFT_SANDBOX_EGRESS:-}" = "restricted" ] || return 0
     chain="KUBESWIFT_SBX_EGRESS"
+
     iptables -N "$chain" 2>/dev/null || iptables -F "$chain"
+
+    # ANTI-SPOOF, and it must be first.
+    #
+    # The chain used to be entered with `-s $src_net`. The guest configures its
+    # own NIC, so it can send with ANY source address -- and a packet whose
+    # source is not in $src_net simply did not match the jump, so it skipped the
+    # whole chain and every DROP below it. Setting a source of 8.8.8.8 was
+    # enough to reach the metadata endpoint and the pod/service CIDRs.
+    #
+    # The jump now keys on the INPUT INTERFACE, which the guest cannot forge
+    # from inside the VM, and anything arriving there with a source outside the
+    # guest subnet is by definition forged.
+    iptables -A "$chain" ! -s "$src_net" -j DROP
+
     iptables -A "$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
     for d in $(grep '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print $2}'); do
         iptables -A "$chain" -d "$d" -p udp --dport 53 -j RETURN
@@ -53,10 +69,32 @@ apply_restricted_egress() {
     iptables -A "$chain" -d 10.0.0.0/8     -j DROP
     iptables -A "$chain" -d 172.16.0.0/12  -j DROP
     iptables -A "$chain" -d 192.168.0.0/16 -j DROP
-    # Idempotent jump at the top of FORWARD for the VM subnet.
-    iptables -C FORWARD -s "$src_net" -j "$chain" 2>/dev/null \
-        || iptables -I FORWARD 1 -s "$src_net" -j "$chain"
-    echo "Restricted egress: $src_net -> DNS + internet; DROP 169.254/16 + RFC1918 (chain $chain)"
+    iptables -A "$chain" -d 100.64.0.0/10  -j DROP  # CGNAT: some CNIs + cloud LB ranges
+    # Idempotent jump at the top of FORWARD, keyed on the guest interface.
+    iptables -C FORWARD -i "$guest_if" -j "$chain" 2>/dev/null \
+        || iptables -I FORWARD 1 -i "$guest_if" -j "$chain"
+
+    # IPv6: the rules above are iptables-only, so on a dual-stack cluster the
+    # guest could reach every blocked destination over IPv6 with nothing in the
+    # way -- including the metadata service and any ULA-addressed pod.
+    #
+    # `restricted` DROPs IPv6 forwarding outright rather than trying to mirror
+    # the v4 policy: the in-pod dnsmasq hands an IPv4 resolver only, the guest's
+    # internet path is the v4 MASQUERADE, and the cluster's v6 CIDRs are not
+    # knowable here. Blocking is therefore both safe and behaviour-preserving --
+    # and a silent partial policy would be worse than none.
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -N "$chain" 2>/dev/null || ip6tables -F "$chain"
+        ip6tables -A "$chain" -j DROP
+        ip6tables -C FORWARD -i "$guest_if" -j "$chain" 2>/dev/null \
+            || ip6tables -I FORWARD 1 -i "$guest_if" -j "$chain"
+        echo "Restricted egress: IPv6 forwarding DROPped on $guest_if"
+    else
+        echo "Restricted egress: ip6tables absent; IPv6 unrestricted (kernel likely has no IPv6)"
+    fi
+
+    echo "Restricted egress: $guest_if ($src_net) -> DNS + internet;" \
+         "DROP spoofed sources + 169.254/16 + RFC1918 + 100.64/10 (chain $chain)"
 }
 
 setup_primary_nic() {
@@ -105,7 +143,7 @@ setup_primary_nic() {
     iptables -t nat -A POSTROUTING -s "$bridge_net" ! -d "$bridge_net" -j MASQUERADE
 
     # Sandbox restricted-egress hardening (no-op unless KUBESWIFT_SANDBOX_EGRESS=restricted).
-    apply_restricted_egress "$bridge_net"
+    apply_restricted_egress "$bridge_net" "$bridge"
 
     echo "Primary NIC: $bridge ($bridge_ip, net $bridge_net) with $tap"
 }
@@ -265,7 +303,7 @@ setup_secondary_nad_nic() {
 #
 # Datapath is cluster-validated (kube-ovn primary NAD: zero-touch cross-node
 # reachability + IP-preserving live migration; see docs/networking/multi-node-l2.md
-# and docs/networking/ovn-l2-install.md). It implements the KubeVirt-style "bridge
+# and docs/networking/ovn-l2-install.md). It implements standard "bridge
 # binding": the NAD's CNI assigns the pod's Multus interface an IP; we hand that
 # exact IP to the GUEST so the guest's primary IP is the NAD's portable IP
 # (survives a move between nodes).
@@ -339,7 +377,7 @@ setup_primary_nad_nic() {
     # bridge makes the kernel add a permanent fdb entry <guest-mac> -> NIC, which
     # SHADOWS the guest's tap: the bridge delivers the guest's return traffic (and
     # unicast DHCP) to the NIC instead of the tap, so the guest is unreachable.
-    # Re-MAC the NIC to a dummy BEFORE enslaving (the KubeVirt bridge-binding
+    # Re-MAC the NIC to a dummy BEFORE enslaving (the bridge-binding
     # pattern). The NIC's kernel MAC is not load-bearing once it is a bridge port;
     # the OVN LSP keeps the guest MAC, so OVN still delivers the guest's frames to
     # the NIC -> bridge -> tap. No-op for every NAD whose IPAM gives the NIC its own
@@ -372,7 +410,7 @@ setup_primary_nad_nic() {
 # automatically, driven by the namespace label; eth0 stays on the cluster default
 # (role infrastructure-locked) for the swiftletd->apiserver control path + egress.
 #
-# Same KubeVirt bridge-binding as setup_primary_nad_nic, with ONE Model-A specific:
+# Same bridge-binding as setup_primary_nad_nic, with ONE Model-A specific:
 # the OVN logical-switch-port PINS MAC+IP in port_security, and that MAC is IP-DERIVED
 # and immutable (0a:58:<ip-octets-hex>). The guest CANNOT present its own 52:54:.. MAC
 # -- OVN drops it. So the guest ADOPTS OVN's MAC: capture it here, hand it to swiftletd
@@ -445,7 +483,7 @@ setup_primary_udn_nic() {
     # The guest adopts OVN's MAC (udn_mac), so the pod NIC's kernel MAC (== udn_mac)
     # would add a permanent fdb entry <udn_mac> -> ovn-udn1 that SHADOWS the guest's
     # tap (return traffic + unicast DHCP go to the NIC, not the guest). Re-MAC the NIC
-    # to a DISTINCT dummy before enslaving (KubeVirt bridge-binding). The OVN LSP keeps
+    # to a DISTINCT dummy before enslaving (bridge binding). The OVN LSP keeps
     # udn_mac, so OVN still delivers the guest's frames NIC -> bridge -> tap. Per-pod
     # netns, so the dummy need only differ from udn_mac within this pod.
     dummy="0a:fe:${udn_mac#*:*:}"

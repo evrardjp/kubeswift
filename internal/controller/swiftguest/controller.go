@@ -34,6 +34,9 @@ import (
 const gpuHypervisorAnnotation = "kubeswift.io/hypervisor-override"
 
 const (
+	// SeedConfigMapSuffix names the rendered seed. It is a SECRET despite the
+	// constant name (kept to avoid churn across the pod builders): user-data
+	// carries SSH keys, passwords and join tokens.
 	SeedConfigMapSuffix = "-seed"
 
 	// defaultNetworkConfig is used when SwiftSeedProfile has no networkData.
@@ -68,6 +71,10 @@ type SwiftGuestReconciler struct {
 	// source pod. When false (default) the launcher pod is byte-for-byte
 	// unchanged from Phase 3a/3b.
 	MigrationMTLSEnabled bool
+	// AllowedHostPathPrefixes mirrors the webhook's host-path allowlist. The
+	// webhook is the primary gate but is disabled by default (it needs
+	// cert-manager), so the controller enforces it too -- see hostpathguard.go.
+	AllowedHostPathPrefixes []string
 
 	// SystemNamespace is the controller-manager's own namespace, where the
 	// migration CA Issuer, the per-node identity Secrets, and the
@@ -110,6 +117,24 @@ func (r *SwiftGuestReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		logger.Error(err, "failed to ensure swiftletd RBAC", "namespace", guest.Namespace)
 		return ctrl.Result{}, err
 	}
+
+	// Per-pod scoped grant (#515). Additive on its own: RBAC is a union, so
+	// while the namespace-wide binding above still exists this narrows nothing.
+	// It is created first so the narrowing — dropping that shared binding — is a
+	// separate, reversible step rather than a flag day.
+	//
+	// The launcher pod is named guest.Name (pod.go), so the scope is known here,
+	// and this runs well before buildPod — the grant is always in place before
+	// swiftletd's first status write.
+	if err := EnsureScopedLauncherRBAC(ctx, r.Client, r.Scheme, &guest, guest.Name, GuestLauncher); err != nil {
+		logger.Error(err, "failed to ensure scoped launcher RBAC", "guest", guest.Name)
+		return ctrl.Result{}, err
+	}
+
+	// The narrowing. Strictly AFTER the scoped grant above, so the launcher never
+	// has a window with neither. Off by default, and never fatal — see
+	// NarrowToScopedRBAC for why it cannot return an error.
+	NarrowToScopedRBAC(ctx, r.Client, guest.Namespace, GuestLauncher)
 
 	// cloneFromSnapshot (Snapshot Phase 4): a guest that boots as a clone of a
 	// SwiftSnapshot has no imageRef/kernelRef. Resolve the snapshot + the live
@@ -212,27 +237,37 @@ func (r *SwiftGuestReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			networkData = defaultNetworkConfig
 		}
 		seedConfigMapName = guest.Name + SeedConfigMapSuffix
-		desiredCM := seed.BuildConfigMap(seedConfigMapName, guest.Namespace, userData, metaData, networkData)
-		if err := controllerutil.SetControllerReference(&guest, desiredCM, r.Scheme); err != nil {
+		// Rendered as a SECRET: user-data routinely carries SSH keys, passwords
+		// and join tokens, and a seed profile can source it from a Secret — which
+		// this used to copy into a ConfigMap, in the clear.
+		desiredSeed := seed.BuildSecret(seedConfigMapName, guest.Namespace, userData, metaData, networkData)
+		if err := controllerutil.SetControllerReference(&guest, desiredSeed, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
-		var existingCM corev1.ConfigMap
-		if err := r.Get(ctx, client.ObjectKey{Namespace: guest.Namespace, Name: seedConfigMapName}, &existingCM); err != nil {
+		var existingSeed corev1.Secret
+		if err := r.Get(ctx, client.ObjectKey{Namespace: guest.Namespace, Name: seedConfigMapName}, &existingSeed); err != nil {
 			if client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.Create(ctx, desiredCM); err != nil {
+			if err := r.Create(ctx, desiredSeed); err != nil {
 				return ctrl.Result{}, err
 			}
 		} else {
-			if !equality.Semantic.DeepEqual(existingCM.Data, desiredCM.Data) ||
-				!equality.Semantic.DeepEqual(existingCM.OwnerReferences, desiredCM.OwnerReferences) {
-				existingCM.Data = desiredCM.Data
-				existingCM.OwnerReferences = desiredCM.OwnerReferences
-				if err := r.Update(ctx, &existingCM); err != nil {
+			// Compare against the rendered form: the apiserver returns Data
+			// (decoded), never StringData, so DeepEqual on StringData would
+			// differ on every reconcile and hot-loop.
+			if !equality.Semantic.DeepEqual(existingSeed.Data, renderedSeedData(desiredSeed)) ||
+				!equality.Semantic.DeepEqual(existingSeed.OwnerReferences, desiredSeed.OwnerReferences) {
+				existingSeed.Data = renderedSeedData(desiredSeed)
+				existingSeed.StringData = nil
+				existingSeed.OwnerReferences = desiredSeed.OwnerReferences
+				if err := r.Update(ctx, &existingSeed); err != nil {
 					return ctrl.Result{}, err
 				}
 			}
+		}
+		if err := r.retireLegacySeedConfigMap(ctx, &guest, seedConfigMapName); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -433,6 +468,53 @@ func (r *SwiftGuestReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// SwiftGPU controller's Resolve stamps status.GPU after scheduling
 	// (status-only, not load-bearing for the runtime). Design doc §A2/§A6.
 
+	// Node placement, BEFORE anything that pins to that node (issue #444).
+	//
+	// The root-disk clone Job below pins to spec.nodeName too. If that node is
+	// unschedulable, the Job's pod sits Pending forever, reconcile never reaches
+	// buildPod, and the guest stalls in Scheduling with nothing explaining why.
+	// Checking here turns a silent stall into a terminal failure with a reason.
+	if err := checkNodePlacementFor(ctx, r.Client, &guest, nil); err != nil {
+		status.Phase = swiftv1alpha1.SwiftGuestPhaseFailed
+		SetResolvedCondition(status, false, err.Error())
+		recordGuestMetrics(&guest, &guest.Status, status, nil)
+		if patchErr := r.patchStatus(ctx, &guest, status); patchErr != nil {
+			return ctrl.Result{}, patchErr
+		}
+		logger.Info("rejected guest: unschedulable spec.nodeName", "error", err.Error())
+		return ctrl.Result{}, nil
+	}
+
+	// Host-path allowlist, BEFORE the root-disk clone. buildPod checks it too,
+	// but too late: a disk-boot guest has cloned its root disk by then, and a
+	// buildPod error is only logged and retried, so a rejected guest showed no
+	// reason at all (a fresh one had no phase and no conditions). With the
+	// webhook off (the chart default), the controller is the only enforcement.
+	//
+	// A launcher pod that already exists predates the allowlist change. The
+	// controller never edits a live launcher, so it is left running and keeps
+	// being reported, with the violation on Resolved. It is not recreated.
+	hostPathErr := checkHostPaths(&guest, r.AllowedHostPathPrefixes)
+	if hostPathErr != nil {
+		SetResolvedCondition(status, false, hostPathErr.Error())
+		var live corev1.Pod
+		podErr := r.Get(ctx, client.ObjectKey{Namespace: guest.Namespace, Name: canonicalPodName(&guest)}, &live)
+		if podErr != nil && !apierrors.IsNotFound(podErr) {
+			return ctrl.Result{}, podErr
+		}
+		if apierrors.IsNotFound(podErr) {
+			status.Phase = swiftv1alpha1.SwiftGuestPhaseFailed
+			recordGuestMetrics(&guest, &guest.Status, status, nil)
+			if patchErr := r.patchStatus(ctx, &guest, status); patchErr != nil {
+				return ctrl.Result{}, patchErr
+			}
+			logger.Info("rejected guest: host path outside the allowlist", "error", hostPathErr.Error())
+			return ctrl.Result{}, nil
+		}
+		logger.Info("host path outside the allowlist; leaving the running launcher pod, which will not be recreated",
+			"pod", live.Name, "error", hostPathErr.Error())
+	}
+
 	// For disk boot, ensure per-guest root disk clone exists and is ready.
 	// RootDisk.FromOCI (a source-independent full-state clone) has NO prepared
 	// image — its disk is materialized from the snapshot's oci disk artifact
@@ -488,23 +570,28 @@ func (r *SwiftGuestReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// Build and create/update pod
-	desiredPod, err := r.buildPod(ctx, &guest, rg, seedConfigMapName, intentConfigMapName, rootDiskClone)
-	if err != nil {
-		logger.Error(err, "failed to build pod spec")
-		return ctrl.Result{}, err
-	}
-	// OVN primary-on-NAD: stamp the guest's MAC (+ pinned IP) so the OVN
-	// logical-switch port identity is the guest, not the pod NIC — otherwise the
-	// bridged guest MAC is unreachable on the segment. Dispatches to the backend
-	// that owns the guest's primary network (kube-ovn today). No-op for every other
-	// networking mode. Fails closed on a NAD Get error (boot-time correctness).
-	if err := r.stampOVNIdentity(ctx, &guest, desiredPod); err != nil {
-		logger.Error(err, "failed to stamp OVN primary-NAD identity")
-		return ctrl.Result{}, err
-	}
-	if err := controllerutil.SetControllerReference(&guest, desiredPod, r.Scheme); err != nil {
-		return ctrl.Result{}, err
+	// Build and create/update pod. The desired pod is only ever used to create a
+	// missing launcher, so it is not built past a host-path rejection: that gets
+	// here only with a launcher already running (see the allowlist check above).
+	var desiredPod *corev1.Pod
+	if hostPathErr == nil {
+		desiredPod, err = r.buildPod(ctx, &guest, rg, seedConfigMapName, intentConfigMapName, rootDiskClone)
+		if err != nil {
+			logger.Error(err, "failed to build pod spec")
+			return ctrl.Result{}, err
+		}
+		// OVN primary-on-NAD: stamp the guest's MAC (+ pinned IP) so the OVN
+		// logical-switch port identity is the guest, not the pod NIC — otherwise the
+		// bridged guest MAC is unreachable on the segment. Dispatches to the backend
+		// that owns the guest's primary network (kube-ovn today). No-op for every other
+		// networking mode. Fails closed on a NAD Get error (boot-time correctness).
+		if err := r.stampOVNIdentity(ctx, &guest, desiredPod); err != nil {
+			logger.Error(err, "failed to stamp OVN primary-NAD identity")
+			return ctrl.Result{}, err
+		}
+		if err := controllerutil.SetControllerReference(&guest, desiredPod, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	var existingPod corev1.Pod
@@ -513,6 +600,12 @@ func (r *SwiftGuestReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, client.ObjectKey{Namespace: guest.Namespace, Name: canonicalPodName(&guest)}, &existingPod); err != nil {
 		if client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
+		}
+		if desiredPod == nil {
+			// The launcher was running at the host-path check and has gone since.
+			// Retry: the next pass finds no pod and fails the guest with the
+			// reason instead of recreating the launcher.
+			return ctrl.Result{}, hostPathErr
 		}
 		// Self-heal a stale migration PodRef before creating the pod.
 		// If status.PodRef points at a <guest>-mig-<uid> pod from a prior
@@ -542,6 +635,10 @@ func (r *SwiftGuestReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// Pod exists; update status from pod
 		podForMetrics = &existingPod
 		MapPodToStatus(&existingPod, status)
+		// AFTER MapPodToStatus, which is what populates status.Network: surface
+		// whether the guest ever acquired an IP, so "Running with no IP forever"
+		// stops being invisible on the CR (#527).
+		MapNetworkReadyCondition(&guest, &existingPod, status)
 		// In-guest identity agent (PR 4): for an agent-enabled cloneFromSnapshot
 		// clone, drive the one-shot identity-regen over vsock once it is Running.
 		// MUST run BEFORE the IP-not-discovered requeue below: a fresh clone has

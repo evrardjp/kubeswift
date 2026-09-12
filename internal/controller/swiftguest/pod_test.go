@@ -531,7 +531,7 @@ func TestBuildPod_NodeName_DiskBoot(t *testing.T) {
 		Spec: swiftv1alpha1.SwiftGuestSpec{
 			ImageRef:      &corev1.LocalObjectReference{Name: "img"},
 			GuestClassRef: corev1.LocalObjectReference{Name: "class"},
-			NodeName:      "miles",
+			NodeName:      "worker-2",
 		},
 	}
 	rg := &resolved.ResolvedGuest{
@@ -542,8 +542,8 @@ func TestBuildPod_NodeName_DiskBoot(t *testing.T) {
 
 	pod := BuildPod(guest, rg, "", "test-intent", nil)
 
-	if pod.Spec.NodeName != "miles" {
-		t.Errorf("pod.Spec.NodeName = %q, want miles", pod.Spec.NodeName)
+	if pod.Spec.NodeName != "worker-2" {
+		t.Errorf("pod.Spec.NodeName = %q, want worker-2", pod.Spec.NodeName)
 	}
 	if pod.Spec.NodeSelector != nil {
 		t.Errorf("disk-boot pod should not have NodeSelector when spec.NodeName is set; got %v", pod.Spec.NodeSelector)
@@ -561,7 +561,7 @@ func TestBuildPod_NodeName_KernelBoot(t *testing.T) {
 		Spec: swiftv1alpha1.SwiftGuestSpec{
 			KernelRef:     &corev1.LocalObjectReference{Name: "k"},
 			GuestClassRef: corev1.LocalObjectReference{Name: "class"},
-			NodeName:      "miles",
+			NodeName:      "worker-2",
 		},
 	}
 	rg := &resolved.ResolvedGuest{
@@ -575,8 +575,8 @@ func TestBuildPod_NodeName_KernelBoot(t *testing.T) {
 
 	pod := BuildPod(guest, rg, "", "test-intent", nil)
 
-	if pod.Spec.NodeName != "miles" {
-		t.Errorf("pod.Spec.NodeName = %q, want miles", pod.Spec.NodeName)
+	if pod.Spec.NodeName != "worker-2" {
+		t.Errorf("pod.Spec.NodeName = %q, want worker-2", pod.Spec.NodeName)
 	}
 	if pod.Spec.NodeSelector["kubeswift.io/kernel-node"] != "true" {
 		t.Errorf("kubeswift.io/kernel-node selector should be preserved; got %v", pod.Spec.NodeSelector)
@@ -810,5 +810,70 @@ func TestBuildPod_NetworkInitHasIntentMount(t *testing.T) {
 	}
 	if !vols["runtime-intent"] || !vols["run"] {
 		t.Errorf("pod missing volumes for network-init mounts: %v", vols)
+	}
+}
+
+// --- schedulerName (#418) ---
+//
+// The launcher already requests the guest's real cpu/memory, so the scheduler
+// can score on utilization; what an operator could not do before was choose a
+// profile that weights free capacity differently (NodeResourcesFit
+// LeastAllocated). These cover the three states that matter.
+
+func schedulerNameGuest(schedulerName, nodeName string) *swiftv1alpha1.SwiftGuest {
+	return &swiftv1alpha1.SwiftGuest{
+		ObjectMeta: metav1.ObjectMeta{Name: "sched", Namespace: "default"},
+		Spec: swiftv1alpha1.SwiftGuestSpec{
+			ImageRef:      &corev1.LocalObjectReference{Name: "img"},
+			GuestClassRef: corev1.LocalObjectReference{Name: "class"},
+			SchedulerName: schedulerName,
+			NodeName:      nodeName,
+		},
+	}
+}
+
+func TestApplySchedulerName_SetsProfile(t *testing.T) {
+	pod := &corev1.Pod{}
+	applySchedulerName(pod, schedulerNameGuest("least-allocated", ""))
+	if pod.Spec.SchedulerName != "least-allocated" {
+		t.Fatalf("schedulerName = %q, want %q", pod.Spec.SchedulerName, "least-allocated")
+	}
+}
+
+func TestApplySchedulerName_EmptyLeavesClusterDefault(t *testing.T) {
+	pod := &corev1.Pod{}
+	applySchedulerName(pod, schedulerNameGuest("", ""))
+	if pod.Spec.SchedulerName != "" {
+		t.Fatalf("schedulerName = %q, want empty so the apiserver defaults it", pod.Spec.SchedulerName)
+	}
+}
+
+// NodeName bypasses the scheduler entirely, so a schedulerName alongside it
+// would be inert text in the pod spec that reads as if it took effect.
+func TestApplySchedulerName_NodeNameWins(t *testing.T) {
+	pod := &corev1.Pod{}
+	guest := schedulerNameGuest("least-allocated", "worker-1")
+	applyNodeName(pod, guest)
+	applySchedulerName(pod, guest)
+	if pod.Spec.NodeName != "worker-1" {
+		t.Fatalf("nodeName = %q, want worker-1", pod.Spec.NodeName)
+	}
+	if pod.Spec.SchedulerName != "" {
+		t.Fatalf("schedulerName = %q, want empty: direct binding skips the scheduler", pod.Spec.SchedulerName)
+	}
+}
+
+// The pool copies its template spec wholesale, so a schedulerName set once on
+// the template reaches every replica. This asserts the field survives the
+// round trip a replica actually takes.
+func TestBuildPod_SchedulerNameReachesLauncher(t *testing.T) {
+	rg := &resolved.ResolvedGuest{
+		Resources:     resolved.Resources{CPU: 2, Memory: 2048},
+		PreparedImage: resolved.PreparedImage{PVCName: "pvc"},
+		Network:       true,
+	}
+	pod := BuildPod(schedulerNameGuest("least-allocated", ""), rg, "", "test-intent", nil)
+	if pod.Spec.SchedulerName != "least-allocated" {
+		t.Fatalf("schedulerName = %q, want least-allocated", pod.Spec.SchedulerName)
 	}
 }

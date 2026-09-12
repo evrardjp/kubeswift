@@ -28,6 +28,15 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # The UI serves static assets; the BROWSER talks to the gateway, not this
+      # pod. It needs no Kubernetes API identity at all. Without these two lines
+      # it falls back to the namespace `default` ServiceAccount and mounts its
+      # token — verified on the dev cluster, where /var/run/secrets/kubernetes.io/
+      # serviceaccount/{token,ca.crt,namespace} were all present in the running
+      # pod. A dedicated empty SA plus automount:false removes a credential the
+      # workload has no use for.
+      serviceAccountName: kubeswift-ui
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -77,12 +86,38 @@ spec:
             periodSeconds: 10
           securityContext:
             allowPrivilegeEscalation: false
-            # nginx regenerates /usr/share/nginx/html/config.js and writes temp
-            # files at startup, so the root filesystem stays writable (the image
-            # runs unprivileged, non-root, with all capabilities dropped).
+            # Read-only root as of kubeswift-ui v0.12.3. Before that the
+            # entrypoint wrote the runtime config to
+            # /usr/share/nginx/html/config.js — inside the directory the SPA is
+            # baked into, which cannot be made writable by mounting over it
+            # without hiding the application. kubeswift-io/kubeswift-ui#43 moved
+            # it to /tmp/kubeswift-ui/config.js, served by an nginx alias.
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            # The two paths this image still has to write, and the ONLY two.
+            #
+            # /tmp                  nginx's pid plus all five *_temp_path dirs,
+            #                       and now the generated config.js.
+            # /etc/nginx/conf.d     20-envsubst-on-templates.sh renders
+            #                       default.conf here from the template at
+            #                       startup. The directory holds nothing else in
+            #                       the image, so an emptyDir masks nothing.
+            #
+            # Both must be writable by uid 101. An emptyDir is created 0777, so
+            # it is; a docker --tmpfs defaults to root-owned 0775 and is NOT,
+            # which is worth knowing if you reproduce this outside Kubernetes.
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-conf-d
+              mountPath: /etc/nginx/conf.d
           resources:
             {{- toYaml .Values.ui.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-conf-d
+          emptyDir: {}
 {{- end }}

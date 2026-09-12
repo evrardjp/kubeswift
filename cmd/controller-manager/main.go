@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -13,10 +15,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	cacheopts "sigs.k8s.io/controller-runtime/pkg/cache"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	imagev1alpha1 "github.com/kubeswift-io/kubeswift/api/image/v1alpha1"
+	kernelv1alpha1 "github.com/kubeswift-io/kubeswift/api/kernel/v1alpha1"
 	seedv1alpha1 "github.com/kubeswift-io/kubeswift/api/seed/v1alpha1"
 	snapshotv1alpha1 "github.com/kubeswift-io/kubeswift/api/snapshot/v1alpha1"
 	swiftv1alpha1 "github.com/kubeswift-io/kubeswift/api/swift/v1alpha1"
@@ -38,6 +42,7 @@ import (
 	evictionwebhook "github.com/kubeswift-io/kubeswift/internal/webhook/eviction"
 	swiftguestwebhook "github.com/kubeswift-io/kubeswift/internal/webhook/swiftguest"
 	swiftimagewebhook "github.com/kubeswift-io/kubeswift/internal/webhook/swiftimage"
+	swiftkernelwebhook "github.com/kubeswift-io/kubeswift/internal/webhook/swiftkernel"
 	swiftmigrationwebhook "github.com/kubeswift-io/kubeswift/internal/webhook/swiftmigration"
 	swiftrestorewebhook "github.com/kubeswift-io/kubeswift/internal/webhook/swiftrestore"
 	swiftsandboxwebhook "github.com/kubeswift-io/kubeswift/internal/webhook/swiftsandbox"
@@ -59,15 +64,33 @@ const (
 	defaultLeaderElectionNS = "kubeswift-system"
 )
 
+// stringSliceFlag collects a repeatable string flag.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	webhookEnabled := flag.Bool("webhook-enabled", false, "Enable admission webhooks (requires TLS certs)")
 	migrationMTLSEnabled := flag.Bool("migration-mtls-enabled", false, "Enable the live-migration mTLS cert provisioner (Phase 3c; requires cert-manager)")
 	leaderElect := flag.Bool("leader-elect", false, "Enable leader election for controller manager")
+	scopedLauncherRBAC := flag.Bool("scoped-launcher-rbac", false,
+		"Retire the namespace-wide launcher RoleBindings and rely solely on the per-pod scoped Roles (#515). "+
+			"Covers guests, migration targets, sandboxes and warm pool slots. "+
+			"Off by default: enabling it DELETES a live grant.")
 	webhookPort := flag.Int("webhook-port", defaultWebhookPort, "Port for webhook server")
 	webhookHost := flag.String("webhook-host", defaultWebhookHost, "Host for webhook server")
 	webhookCertDir := flag.String("webhook-cert-dir", defaultCertDir, "Directory containing webhook TLS certs (tls.crt, tls.key)")
 	metricsAddr := flag.String("metrics-bind-address", ":8080", "Address for metrics endpoint")
+	var allowedHostPaths stringSliceFlag
+	flag.Var(&allowedHostPaths, "allowed-hostpath-prefix",
+		"Host-path prefix a SwiftGuest may mount into the (privileged) launcher pod "+
+			"-- spec.filesystems[].source.hostPath and vhost-user socket dirs. Repeatable. "+
+			"EMPTY DENIES ALL, which is the default: opt in per cluster.")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -77,6 +100,12 @@ func main() {
 		fmt.Printf("controller-manager %s (git %s)\n", version.Version, version.GitCommit)
 		os.Exit(0)
 	}
+
+	// Published as a package var rather than threaded through every reconciler:
+	// the switch is read at two points in two controllers (swiftguest and
+	// swiftmigration), and passing it through both constructors would widen
+	// their signatures for a value that never changes after startup.
+	swiftguest.ScopedOnly = *scopedLauncherRBAC
 
 	certDir := *webhookCertDir
 	if envCertDir := os.Getenv(webhookCertDirEnv); envCertDir != "" {
@@ -175,8 +204,18 @@ func main() {
 		SystemNamespace:      leaderElectionNS,
 		SnapshotS3Image:      swiftsnapshot.SnapshotS3Image(),
 		SnapshotORASImage:    swiftsnapshot.SnapshotORASImage(),
-	}).SetupWithManager(mgr); err != nil {
+
+		AllowedHostPathPrefixes: allowedHostPaths}).SetupWithManager(mgr); err != nil {
 		klog.ErrorS(err, "unable to create SwiftGuest controller")
+		os.Exit(1)
+	}
+
+	// Retires the legacy `default` subject from launcher RoleBindings once a
+	// namespace stops running legacy launchers. Convergence otherwise only runs
+	// from a guest/sandbox reconcile, so a fully drained namespace would keep
+	// the namespace-wide pods:patch grant forever (#443).
+	if err = (&swiftguest.LauncherRBACReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+		klog.ErrorS(err, "unable to create launcher-rbac controller")
 		os.Exit(1)
 	}
 
@@ -301,7 +340,7 @@ func main() {
 
 	if *webhookEnabled {
 		if err = ctrl.NewWebhookManagedBy(mgr, &swiftv1alpha1.SwiftGuest{}).
-			WithCustomValidator(&swiftguestwebhook.Validator{}).
+			WithCustomValidator(&swiftguestwebhook.Validator{AllowedHostPathPrefixes: allowedHostPaths}).
 			WithCustomDefaulter(&swiftguestwebhook.Defaulter{}).
 			Complete(); err != nil {
 			klog.ErrorS(err, "unable to create SwiftGuest webhook")
@@ -312,6 +351,12 @@ func main() {
 			WithCustomDefaulter(&swiftimagewebhook.Defaulter{}).
 			Complete(); err != nil {
 			klog.ErrorS(err, "unable to create SwiftImage webhook")
+			os.Exit(1)
+		}
+		if err = ctrl.NewWebhookManagedBy(mgr, &kernelv1alpha1.SwiftKernel{}).
+			WithCustomValidator(&swiftkernelwebhook.Validator{}).
+			Complete(); err != nil {
+			klog.ErrorS(err, "unable to create SwiftKernel webhook")
 			os.Exit(1)
 		}
 		if err = ctrl.NewWebhookManagedBy(mgr, &seedv1alpha1.SwiftSeedProfile{}).
@@ -362,10 +407,76 @@ func main() {
 	}
 
 	klog.InfoS("starting manager", "version", version.Version, "git", version.GitCommit)
+	go watchdogCacheSync(ctx, mgr)
 	if err := mgr.Start(ctx); err != nil {
 		klog.ErrorS(err, "manager exited with error")
 		os.Exit(1)
 	}
+}
+
+// cacheSyncDeadline bounds how long the manager may run with an unsynced cache
+// before it gives up. Generous enough for a cold apiserver and a large fleet;
+// far short of "forever", which is the default and the bug (#460).
+var cacheSyncDeadline = 3 * time.Minute
+
+// watchdogCacheSync turns an un-syncable informer into a crash instead of a
+// silent, permanent no-op.
+//
+// controller-runtime's cached client starts an informer per watched type and
+// retries a failing LIST forever. The manager keeps running, the pod stays
+// Ready, and NOTHING reconciles — not just the affected type, all of it,
+// because no controller starts until the cache syncs. Observed for real when a
+// controller built after the launcher-ServiceAccount work ran against an older
+// chart's RBAC: `serviceaccounts is forbidden` every 15s, and freshly created
+// SwiftGuests sat with a completely empty .status, no pod, no event, no phase.
+// The operator has nothing to go on; `kubectl get deploy` says healthy.
+//
+// That is the most complete violation of "no silent failures" the system can
+// manage, so make it loud: wait a bounded time for the cache, and if it has not
+// synced, log the likely cause and exit non-zero. CrashLoopBackOff plus the
+// reflector's own "is forbidden" lines is a diagnosis; an idle Running pod is
+// not.
+//
+// The deadline is only armed while the process should be starting up — a normal
+// ctx cancellation (SIGTERM, lost leader election) exits quietly and is not a
+// sync failure.
+// A NOTE ON WHY THIS WAS NEEDED, given the comment above about VolumeSnapshot:
+// a MISSING CRD and a FORBIDDEN LIST fail differently. No such type at all fails
+// when the informer is constructed, and the manager does exit — which is what
+// that comment describes and why the CRD check exists. A type that exists but
+// which RBAC denies fails inside the reflector's retry loop instead, forever,
+// with the manager perfectly healthy. Only the second case is silent.
+func watchdogCacheSync(ctx context.Context, mgr manager.Manager) {
+	if err := cacheSyncOutcome(ctx, cacheSyncDeadline, mgr.GetCache().WaitForCacheSync); err != nil {
+		klog.ErrorS(err, "REFUSING TO RUN with an unsynced informer cache")
+		os.Exit(1)
+	}
+}
+
+// cacheSyncOutcome holds the decision, separate from the process exit, so the
+// three outcomes are testable without a real manager.
+//
+// Returns nil when the cache syncs, and nil when the parent context is already
+// done — a SIGTERM or a lost leader election during start-up is a shutdown, not
+// a fault, and must not be reported as one. Returns an error only when the
+// deadline passes with the process still expected to be running.
+func cacheSyncOutcome(ctx context.Context, deadline time.Duration, waitForCacheSync func(context.Context) bool) error {
+	deadlined, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	if waitForCacheSync(deadlined) {
+		klog.InfoS("informer cache synced")
+		return nil
+	}
+	if ctx.Err() != nil {
+		return nil // shutting down, not a sync failure
+	}
+	return fmt.Errorf("informer cache did not sync within %s. No controller reconciles until "+
+		"EVERY watched type syncs, so this process would otherwise sit idle and Ready while doing "+
+		"nothing at all — no pods created, no status written, for any resource. The usual cause is "+
+		"missing RBAC on a watched type: look for \"is forbidden\" from the reflector above and grant "+
+		"the controller-manager ClusterRole list+watch on that resource. Running a controller image "+
+		"newer than its chart's RBAC produces exactly this", deadline)
 }
 
 // volumeSnapshotCRDsInstalled reports whether the CSI external-snapshotter

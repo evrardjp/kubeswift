@@ -430,6 +430,12 @@ spec:
                       description: |-
                         MAC optionally pins the interface MAC address. When empty a deterministic
                         MAC is generated. Honored for vhost-user (and bridge) interfaces.
+
+                        Constrained to a canonical colon-separated MAC. This is a security
+                        boundary, not cosmetics: network-init.sh writes the value into a shell
+                        env file that launcher-entrypoint.sh SOURCES, so an unconstrained value
+                        containing $(...) would execute in the privileged launcher container.
+                      pattern: ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$
                       type: string
                     name:
                       description: |-
@@ -577,7 +583,7 @@ spec:
                     description: |-
                       Binding selects the primary interface's relationship to the pod network:
                         nat    (default) — VM behind the pod IP; ports are Service-exposable via
-                                           an in-pod DNAT (KubeVirt masquerade model).
+                                           an in-pod DNAT (the masquerade model).
                         bridge          — primary rides a multi-node-L2 NAD (portable IP); ports
                                            are NOT in-pod-DNAT'd (they reach the NAD IP). expose
                                            is rejected for bridge; ports without expose are
@@ -707,6 +713,28 @@ spec:
                 - RestartOnFailure
                 - Always
                 type: string
+              schedulerName:
+                description: |-
+                  SchedulerName routes the launcher pod to a specific kube-scheduler
+                  profile (pod.spec.schedulerName). Empty means the cluster default.
+
+                  The launcher pod already carries accurate requests — cpu equal to the
+                  guest's vCPU count and memory equal to guest RAM plus the launcher
+                  overhead, with requests == limits — so the scheduler scores nodes on
+                  the guest's real footprint. What the default profile does NOT let an
+                  operator choose is how heavily free capacity weighs against the other
+                  scoring terms. A profile configured with the NodeResourcesFit
+                  LeastAllocated strategy biases placement toward less-loaded nodes;
+                  naming it here is how a guest (or every replica of a pool, via the
+                  pool template) opts into it.
+
+                  This is placement policy, not placement: an unknown scheduler name
+                  leaves the pod Pending forever, because no scheduler claims it. Set it
+                  only to a profile that exists in the cluster's scheduler config.
+
+                  Ignored when NodeName is set — direct binding bypasses the scheduler
+                  entirely, so no profile ever sees the pod.
+                type: string
               seedProfileRef:
                 description: SeedProfileRef references a SwiftSeedProfile for cloud-init
                   (disk boot only).
@@ -763,7 +791,7 @@ spec:
                   volumeMode:
                     description: |-
                       VolumeMode is the PVC volumeMode. Defaults to Filesystem. Block is
-                      required for live-migration-capable RWX (KubeVirt model) and for
+                      required for live-migration-capable RWX and for
                       some CSI drivers' raw-device passthrough; the value flows to PVC
                       spec verbatim.
                     enum:

@@ -46,7 +46,27 @@ spec:
           metadata:
             type: object
           spec:
-            description: SwiftSeedProfileSpec defines the desired state of SwiftSeedProfile.
+            description: |-
+              SwiftSeedProfileSpec defines the desired state of SwiftSeedProfile.
+
+              UserData and UserDataFrom are alternatives, and the rule below is what says
+              so to the apiserver. Until it existed, UserData was a bare required field, so
+              the CRD schema rejected every userDataFrom-only profile with
+              "spec.userData: Required value" — before admission ran, which meant the
+              validating webhook's own (correct) either-or check never got to see the
+              object. The Secret-backed path was implemented, sampled and documented as the
+              way to keep credentials out of Git, and could not be used at all.
+
+              Expressed as CEL rather than left to the webhook because the webhook is off
+              by default: a rule that only holds when webhook.enabled=true is not a rule.
+
+              The emptiness test is size(...) and not a comparison against a quoted empty
+              string ON PURPOSE. gofmt rewrites a doubled apostrophe inside a comment to a
+              typographic closing quote, and a kubebuilder marker IS a comment: writing the
+              CEL literal the obvious way silently turns the rule into a comparison against
+              a curly quote the next time anyone runs gofmt, and controller-gen then bakes
+              that into the CRD. CI runs gofmt, so CI would have been the thing that broke
+              it. size() needs no quotes and cannot be rewritten.
             properties:
               datasource:
                 description: DatasourceType is the cloud-init datasource type.
@@ -54,6 +74,15 @@ spec:
                 - NoCloud
                 type: string
               metaData:
+                description: |-
+                  MetaData is inline NoCloud instance metadata (use MetaDataFrom for a ref).
+
+                  Optional because it is DEFAULTED, not because NoCloud works without it: a
+                  NoCloud seed disk with no meta-data file is not recognised as a datasource
+                  at all, and cloud-init then discards userData wholesale while the guest
+                  still boots and reports Ready (#457). When neither this nor MetaDataFrom is
+                  set, the controller synthesizes `instance-id: <namespace>-<guest>` +
+                  `local-hostname: <guest>`. Set it only to override that.
                 type: string
               metaDataFrom:
                 description: SeedDataValueFrom holds a reference to Secret or ConfigMap.
@@ -63,7 +92,9 @@ spec:
                     description: Selects a key from a ConfigMap.
                     properties:
                       key:
-                        description: The key to select.
+                        description: |-
+                          The key to select from the ConfigMap's Data field.
+                          Keys in the BinaryData field are not currently propagated to container env vars.
                         type: string
                       name:
                         default: ""
@@ -117,7 +148,9 @@ spec:
                     description: Selects a key from a ConfigMap.
                     properties:
                       key:
-                        description: The key to select.
+                        description: |-
+                          The key to select from the ConfigMap's Data field.
+                          Keys in the BinaryData field are not currently propagated to container env vars.
                         type: string
                       name:
                         default: ""
@@ -162,6 +195,13 @@ spec:
                     x-kubernetes-map-type: atomic
                 type: object
               userData:
+                description: |-
+                  UserData is inline cloud-init user-data.
+
+                  Optional at the schema level, but a profile needs EITHER this or
+                  UserDataFrom: see the XValidation rule on this struct. Prefer
+                  UserDataFrom for anything carrying credentials, so the content lives in
+                  a Secret rather than in the manifest (docs/gitops/secrets.md).
                 type: string
               userDataFrom:
                 description: SeedDataValueFrom holds a reference to Secret or ConfigMap.
@@ -171,7 +211,9 @@ spec:
                     description: Selects a key from a ConfigMap.
                     properties:
                       key:
-                        description: The key to select.
+                        description: |-
+                          The key to select from the ConfigMap's Data field.
+                          Keys in the BinaryData field are not currently propagated to container env vars.
                         type: string
                       name:
                         default: ""
@@ -217,8 +259,10 @@ spec:
                 type: object
             required:
             - datasource
-            - userData
             type: object
+            x-kubernetes-validations:
+            - message: one of spec.userData or spec.userDataFrom is required
+              rule: (has(self.userData) && size(self.userData) > 0) || has(self.userDataFrom)
         type: object
     served: true
     storage: true

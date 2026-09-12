@@ -11,9 +11,9 @@
 
 | ID | Severity | Component | Finding |
 |----|----------|-----------|---------|
-| SEC-01 | ~~CRITICAL~~ RESOLVED | launcher container | ~~`privileged: true`~~ Replaced with drop ALL + NET_ADMIN, SYS_ADMIN (non-GPU) / + SYS_RESOURCE, DAC_OVERRIDE (GPU) |
-| SEC-02 | ~~CRITICAL~~ RESOLVED | network-init container | ~~`privileged: true`~~ Replaced with drop ALL + NET_ADMIN, NET_RAW |
-| SEC-03 | ~~HIGH~~ RESOLVED | gpu-init container | ~~`privileged: true`~~ Replaced with drop ALL + SYS_ADMIN; sysfs-pci hostPath volume added |
+| SEC-01 | ACCEPTED (was CRITICAL) | launcher container | `privileged: true`. The capability-based replacement was implemented, then **reverted** — see the note below. |
+| SEC-02 | ACCEPTED (was CRITICAL) | network-init container | `privileged: true`. Same revert as SEC-01. |
+| SEC-03 | ACCEPTED (was HIGH) | gpu-init container | `privileged: true`. Same revert as SEC-01. |
 | SEC-04 | HIGH (mitigated) | /dev/vfio hostPath | Entire `/dev/vfio` directory mounted — documented why scoping is impractical (VFIO group files created during bind) |
 | SEC-05 | ~~HIGH~~ RESOLVED | PCI address injection | BDF format validation added to gpu-init.sh (regex: `^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$`) |
 | SEC-06 | ~~HIGH~~ RESOLVED | Fabric Manager partition isolation | Partition ownership validated against SwiftGPUNode allocatedTo before pod creation |
@@ -28,6 +28,31 @@
 | SEC-15 | LOW | Kernel pull job runs as root | Pull job uses `runAsUser: 0` for hostPath write; could be scoped tighter |
 | SEC-16 | LOW | VFIO bind interrupted state | gpu-init.sh unbind/rebind is not atomic; crash leaves device driverless |
 | SEC-17 | LOW | Guest-to-pod network reachability | Bridge subnet is hardcoded; no network policy enforcement on guest traffic |
+
+> **Correction (2026-07-25).** SEC-01/02/03 were marked RESOLVED in the April
+> audit because the capability-based security contexts had just landed. That
+> approach was subsequently **reverted**: dropping to explicit capabilities
+> produced a cascade of runtime failures during QEMU boot validation
+> (`/dev/net/tun` unavailable, `/proc/sys/net/ipv4/ip_forward` unwritable,
+> sysctl allowlist), each needing a rebuild + redeploy + cluster config change.
+>
+> The decision taken was that a VM platform managing KVM, VFIO, tap devices and
+> iptables inherently needs deep host access, and that capability
+> micromanagement added complexity without proportionate benefit. So
+> `internal/controller/swiftguest/security.go` returns `privileged: true` for
+> the launcher, network-init, gpu-init and clone-grow-init containers, and that
+> is deliberate.
+>
+> **The launcher pod is therefore a node-level trust boundary, not a
+> container-level one.** Anything a SwiftGuest can make the launcher do — mount
+> a host path, open a socket, reach a device — is node-root. That is why host
+> paths are confined to an operator allowlist
+> (`swiftGuest.allowedHostPathPrefixes`) rather than accepted verbatim.
+>
+> Components that genuinely do not need host access are still hardened and
+> should stay that way: gpu-discovery and the DRA driver run `privileged:
+> false` + drop-ALL + read-only rootfs, and the gateway and UI run non-root.
+
 | SEC-18 | LOW | No seccomp profile | No containers specify a seccomp profile |
 | SEC-19 | LOW | OVMF_VARS template world-readable | Writable UEFI variable store copied without restrictive permissions |
 
@@ -232,7 +257,7 @@ The partition ID is passed to the gpu-init container via environment variable `G
 
 **Blast radius:** Low direct security risk since KVM is designed for multi-tenant use. However, this blocks adoption of Pod Security Standards and prevents proper resource tracking.
 
-**Recommended fix:** Use the KVM device plugin (`github.com/kubevirt/kubernetes-device-plugins/cmd/kvm`) which exposes `devices.kubevirt.io/kvm` as a schedulable resource. This integrates with PSS Restricted profile and enables proper resource accounting.
+**Recommended fix:** Expose `/dev/kvm` through a KVM device plugin rather than a hostPath, so it becomes a schedulable resource the kubelet accounts for. Several exist in the ecosystem; any of them integrates with the PSS Restricted profile and enables proper resource accounting, which a hostPath mount cannot.
 
 ---
 
@@ -477,6 +502,110 @@ The OVMF_VARS.fd file is copied with the default permissions of the source file.
 **Recommended fix:** Set permissions to `0600` after copy and ensure the runtime directory is only writable by the swiftletd process.
 
 ---
+
+## Accepted risk: `create pods` in a VM namespace is node-admin
+
+**Status: accepted and documented (#443). Not a defect report — a threat-model boundary.**
+
+A launcher pod is privileged by design (see SEC-01/02/03 above). swiftletd reports
+status by patching annotations onto its own pod, so the launcher ServiceAccount
+holds `pods: get,patch` in the workload namespace. Because
+`spec.containers[*].image` is mutable and kubelet restarts a container whose spec
+hash changed — regardless of `restartPolicy: Never` — anyone who can obtain that
+grant can repoint the privileged launcher's image and get node root.
+
+From v0.13.6 launchers run as dedicated ServiceAccounts rather than the namespace
+`default`, which removes *incidental* inheritance: ordinary Jobs, sidecars,
+CronJobs and debug pods in the namespace no longer hold `pods: patch` by accident.
+
+**From v0.13.8 a ValidatingAdmissionPolicy closes the residual** (#443). The
+dedicated ServiceAccount removed *incidental* inheritance but did not close the
+escalation, because Kubernetes has no RBAC gate on which ServiceAccount a pod may
+name: anyone able to create a Pod could write `serviceAccountName:
+kubeswift-launcher`, receive the token, patch the privileged launcher's image,
+and reach node root. Scoping the reporter Role with `resourceNames` does not fix
+that either — RBAC is additive and the ServiceAccount is shared, so the attacker
+inherits the union of every launcher pod name in the namespace. Verified on a
+live cluster.
+
+`kubeswift-launcher-sa-gate` supplies the missing gate: only the KubeSwift
+controller may create a Pod naming a launcher ServiceAccount. It is a
+ValidatingAdmissionPolicy rather than a webhook deliberately — the rule must
+match every Pod CREATE, and a webhook with `failurePolicy: Fail` would make all
+pod creation depend on our webhook server being up. VAP is evaluated in-tree.
+
+The policy is rendered only where the cluster serves
+`admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy` (k8s 1.30+) and can
+be disabled with `launcherSAGate.enabled=false`. **Where it is off, the KubeSwift
+workload namespace is a trust boundary**: anyone who can create a Pod there can
+reach node root, and should be treated as equivalent to a node-level
+administrator. That is the same acceptance posture as SEC-01/02/03 above.
+
+**It does not close the escalation, and neither would `resourceNames` scoping.**
+Kubernetes has no RBAC gate on which ServiceAccount a pod may reference — there is
+no `serviceaccounts/use` subresource and no verb for it. A tenant who can create
+pods simply names the launcher SA on a pod of their own and receives its token.
+Verified on a live cluster:
+
+```
+$ kubectl auth can-i patch pods -n <ns> --as=system:serviceaccount:<ns>:tenant
+no
+
+$ # ...as that same tenant, create a pod with `serviceAccountName: <launcher-sa>`
+pod/attacker created
+$ kubectl -n <ns> get pod attacker -o jsonpath='{.spec.serviceAccountName} {.spec.volumes[0].name}'
+<launcher-sa> kube-api-access-7qq6x
+```
+
+The token is mounted, so the tenant now holds whatever the launcher SA holds.
+Scoping the grant with `resourceNames` narrows *which* launcher pods are
+reachable; it does not stop the tenant reaching them.
+
+This matters most where Pod Security Admission stops a tenant from creating a
+privileged pod directly — they cannot make their own, but they can repoint the
+one already running.
+
+### The boundary
+
+**Treat `create pods` in a namespace that runs SwiftGuests or SwiftSandboxes as
+equivalent to node-admin on the nodes those workloads land on.** Grant it only to
+principals you would trust with node root.
+
+Practically:
+
+- Run tenant workloads in namespaces that do **not** run KubeSwift launchers.
+- Do not grant `create pods` in VM namespaces to anyone who should not have node
+  access; namespace-admin there is cluster-significant.
+- Node isolation (taints/affinity) bounds *which* nodes are exposed, not whether.
+
+### What closes it
+
+- **Admission control — SHIPPED in v0.13.8.** `kubeswift-launcher-sa-gate`
+  rejects any Pod naming a launcher ServiceAccount unless the KubeSwift
+  controller created it (see above). This is what closes the escalation. The
+  paragraphs above describe the posture where it is disabled.
+- **Removing the grant** — move swiftletd's status reporting off pod annotations
+  onto a channel that needs no write access to its own pod. Would close it at the
+  source rather than by admission; a rework of the status path in both the
+  runtime and the controller. Not implemented.
+
+### Defence in depth: per-launcher-pod scoping (#515)
+
+From the `scopedLauncherRBAC` gate (default off), each launcher pod holds a Role
+scoped with `resourceNames` to exactly its own pod, and the shared namespace-wide
+RoleBinding is retired. Guests, migration targets, sandboxes and warm pool slots
+are all covered.
+
+Read this for what it is. It does **not** close the escalation — that is the VAP
+above, and the reason is unchanged: RBAC is additive on a shared ServiceAccount,
+so an attacker who obtains the SA still inherits the union of every launcher
+grant in the namespace. What it buys is that the token is worth one pod rather
+than the namespace when it leaks by some route other than SA-naming — a stolen
+projected token, a compromised node, a mounted secret.
+
+A sandbox launcher is granted no `swiftguests/status` at all: it runs untrusted
+code and has no SwiftGuest CR, so the grant would only let an escaped sandbox
+forge guest status on someone else's VM.
 
 ## Cross-Cutting Observations
 

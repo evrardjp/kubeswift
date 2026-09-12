@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"testing"
 
 	connect "connectrpc.com/connect"
@@ -15,12 +17,15 @@ import (
 
 func TestClusterService_ListClusters_NamespaceScoped(t *testing.T) {
 	hub := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
-		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "boba", Namespace: "kubeswift-system"}},
-		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "miles", Namespace: "kubeswift-system"}},
+		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "edge-1", Namespace: "kubeswift-system"}},
+		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "edge-2", Namespace: "kubeswift-system"}},
 		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "elsewhere", Namespace: "other"}},
 	).Build()
 
-	svc := NewClusterService(hub, "kubeswift-system", nil, nil, nil) // ListClusters uses only the hub cache
+	// ListClusters uses only the hub cache, but it DOES authenticate — passing a
+	// nil Authenticator here is what let the unauthenticated-fleet-enumeration
+	// bug ship (a nil auth would panic, not pass).
+	svc := NewClusterService(hub, "kubeswift-system", nil, nil, NewInsecureAuthenticator())
 	resp, err := svc.ListClusters(context.Background(), connect.NewRequest(&kubeswiftv1.ListClustersRequest{}))
 	if err != nil {
 		t.Fatalf("ListClusters: %v", err)
@@ -32,7 +37,7 @@ func TestClusterService_ListClusters_NamespaceScoped(t *testing.T) {
 	for _, c := range resp.Msg.Clusters {
 		names[c.Name] = true
 	}
-	if !names["boba"] || !names["miles"] || names["elsewhere"] {
+	if !names["edge-1"] || !names["edge-2"] || names["elsewhere"] {
 		t.Errorf("unexpected cluster set: %v", names)
 	}
 }
@@ -42,11 +47,11 @@ func TestClusterWatcher_EmitSubscribeUnsubscribe(t *testing.T) {
 	sub := w.subscribe()
 
 	w.emit(kubeswiftv1.EventType_EVENT_TYPE_ADDED,
-		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "boba"}})
+		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "edge-1"}})
 
 	select {
 	case ev := <-sub:
-		if ev.Type != kubeswiftv1.EventType_EVENT_TYPE_ADDED || ev.Cluster.GetName() != "boba" {
+		if ev.Type != kubeswiftv1.EventType_EVENT_TYPE_ADDED || ev.Cluster.GetName() != "edge-1" {
 			t.Errorf("unexpected event: %+v", ev)
 		}
 	default:
@@ -71,4 +76,47 @@ func TestClusterWatcher_NonBlockingOnSlowSubscriber(t *testing.T) {
 			&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "x"}})
 	}
 	// Reaching here without deadlock is the assertion.
+}
+
+// rejectingAuthenticator stands in for a real authenticator refusing a caller
+// with no/!valid credentials.
+type rejectingAuthenticator struct{}
+
+func (rejectingAuthenticator) Authenticate(context.Context, http.Header) (Identity, error) {
+	return Identity{}, connect.NewError(connect.CodeUnauthenticated, errors.New("no credentials"))
+}
+
+// The fleet list carries every member's apiserver URL and version, so an
+// unauthenticated caller must not be able to enumerate it. Both RPCs shipped
+// without an Authenticate call; these pin them.
+func TestClusterService_ListClusters_RequiresAuth(t *testing.T) {
+	hub := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
+		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "edge-1", Namespace: "kubeswift-system"}},
+	).Build()
+
+	svc := NewClusterService(hub, "kubeswift-system", nil, nil, rejectingAuthenticator{})
+	resp, err := svc.ListClusters(context.Background(), connect.NewRequest(&kubeswiftv1.ListClustersRequest{}))
+	if err == nil {
+		t.Fatalf("ListClusters accepted an unauthenticated caller and returned %d clusters", len(resp.Msg.GetClusters()))
+	}
+	if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+		t.Errorf("code = %v, want %v", got, connect.CodeUnauthenticated)
+	}
+}
+
+func TestClusterService_WatchClusters_RequiresAuth(t *testing.T) {
+	hub := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
+		&fleetv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "edge-1", Namespace: "kubeswift-system"}},
+	).Build()
+
+	// nil watcher + nil stream on purpose: the auth check must reject BEFORE
+	// subscribe() or the first Send, so neither is ever reached.
+	svc := NewClusterService(hub, "kubeswift-system", nil, nil, rejectingAuthenticator{})
+	err := svc.WatchClusters(context.Background(), connect.NewRequest(&kubeswiftv1.WatchClustersRequest{}), nil)
+	if err == nil {
+		t.Fatal("WatchClusters accepted an unauthenticated caller")
+	}
+	if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+		t.Errorf("code = %v, want %v", got, connect.CodeUnauthenticated)
+	}
 }

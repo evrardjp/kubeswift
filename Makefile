@@ -70,6 +70,8 @@ help:
 	@echo "  print-version         Print version info from hack/version.sh"
 	@echo "  generate              Generate CRDs and deepcopy (also syncs charts/ + runs verify-crd-sync)"
 	@echo "  verify-crd-sync       Fail if config/crd/kustomization.yaml drifts from config/crd/bases/"
+	@echo "  verify-render-coverage Fail if the lint profile stops rendering a workload CI expects to scan"
+	@echo "  verify-values-schema  Fail if the chart's values.schema.json stops rejecting unknown keys or drifts from values.yaml"
 	@echo "  deploy                Deploy controller-manager (minimal install, no webhooks). Use deploy-with-webhook for webhook-enabled deploys (requires cert-manager)."
 	@echo "  deploy-with-webhook   Deploy controller-manager with admission webhooks enabled (requires cert-manager cluster-side; applies config/overlays/webhook on top of the minimal install)"
 	@echo "  deploy-with-mtls      Deploy controller-manager with live-migration mTLS cert provisioner enabled (Phase 3c; requires cert-manager cluster-side; applies config/overlays/migration-mtls on top of the minimal install)"
@@ -196,6 +198,20 @@ generate:
 
 verify-crd-sync:
 	./hack/verify-crd-sync.sh
+
+verify-render-coverage:
+	./hack/verify-render-coverage.sh
+
+verify-image-tags:
+	./hack/verify-image-tags.sh
+
+verify-values-schema:
+	./hack/verify-values-schema.sh
+
+verify-cosign-interop: ## Cross-check that our cosign signatures verify (#486). Needs docker.
+	@# Not in any CI gate: it pulls release binaries and runs a local registry.
+	@# Run it before changing how anything is signed or verified.
+	./hack/cosign-interop.sh
 
 .PHONY: proto proto-lint
 proto: ## Regenerate Go (messages + connect handlers) from proto/ into gen/.

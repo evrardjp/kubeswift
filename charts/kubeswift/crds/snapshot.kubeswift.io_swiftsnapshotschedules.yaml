@@ -20,6 +20,9 @@ spec:
     - jsonPath: .spec.schedule
       name: Schedule
       type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
     - jsonPath: .spec.suspend
       name: Suspend
       type: boolean
@@ -88,8 +91,12 @@ spec:
                 type: object
               schedule:
                 description: |-
-                  Schedule is a standard 5-field cron expression, evaluated in UTC.
+                  Schedule is a standard 5-field cron expression, evaluated in UTC
+                  regardless of the controller pod's own timezone.
                   Example: "0 2 * * *" (daily at 02:00 UTC).
+                  To schedule in another zone, prefix with CRON_TZ=, e.g.
+                  "CRON_TZ=Europe/Rome 0 2 * * *" — that fires at 02:00 Rome time and
+                  shifts against UTC across DST.
                 type: string
               startingDeadlineSeconds:
                 description: |-
@@ -346,7 +353,12 @@ spec:
                   type: string
                 type: array
               conditions:
-                description: Conditions exposes Ready.
+                description: |-
+                  Conditions exposes Ready: True once spec.schedule parses and the schedule
+                  is live, False with reason InvalidSchedule when it does not parse, and
+                  False with reason Suspended while spec.suspend is set. An unparseable
+                  schedule is otherwise invisible -- nothing else in spec or status changes,
+                  and the schedule simply never fires.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

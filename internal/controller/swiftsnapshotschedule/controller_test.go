@@ -5,8 +5,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	// Embedded zoneinfo, so the explicit-zone test does not depend on host tzdata.
+	_ "time/tzdata"
 
 	"github.com/robfig/cron/v3"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -231,6 +234,71 @@ func TestReconcile_StartingDeadline_SkipsTooLate(t *testing.T) {
 	}
 }
 
+// withLocalTZ stands in for a pod given a timezone (a mounted /etc/localtime),
+// or a contributor running the suite outside UTC.
+func withLocalTZ(t *testing.T, offset time.Duration) {
+	t.Helper()
+	orig := time.Local
+	time.Local = time.FixedZone("TEST", int(offset/time.Second))
+	t.Cleanup(func() { time.Local = orig })
+}
+
+// spec.schedule is documented as UTC; unpinned, it would follow the zone of the
+// times the reconcile loop hands it, which are always local.
+func TestParseScheduleUTC_IgnoresProcessTimezone(t *testing.T) {
+	withLocalTZ(t, 5*time.Hour)
+
+	sched, err := parseScheduleUTC("0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A local-zone time, as the reconcile loop passes.
+	from := time.Date(2026, 6, 6, 0, 0, 0, 0, time.Local)
+	want := time.Date(2026, 6, 6, 2, 0, 0, 0, time.UTC)
+	if got := sched.Next(from); !got.Equal(want) {
+		t.Errorf("next tick = %v (%v UTC), want %v", got, got.UTC(), want)
+	}
+}
+
+// Pinning UTC must not override a zone the expression asked for.
+func TestParseScheduleUTC_HonoursExplicitZone(t *testing.T) {
+	withLocalTZ(t, 5*time.Hour)
+
+	sched, err := parseScheduleUTC("CRON_TZ=Asia/Tokyo 0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokyo, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 00:00 UTC is already 09:00 in Tokyo, so the next 02:00 there is tomorrow's.
+	from := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 6, 7, 2, 0, 0, 0, tokyo)
+	if got := sched.Next(from); !got.Equal(want) {
+		t.Errorf("next tick = %v (%v UTC), want %v", got, got.UTC(), want)
+	}
+}
+
+// @every has no location; pinning must not drop it on the type assertion.
+func TestParseScheduleUTC_IntervalSchedule(t *testing.T) {
+	sched, err := parseScheduleUTC("@every 30m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	if got, want := sched.Next(from), from.Add(30*time.Minute); !got.Equal(want) {
+		t.Errorf("next tick = %v, want %v", got, want)
+	}
+}
+
+// Parser errors pass through unchanged.
+func TestParseScheduleUTC_RejectsInvalid(t *testing.T) {
+	if _, err := parseScheduleUTC("not a cron"); err == nil {
+		t.Error("expected an error for an invalid cron expression")
+	}
+}
+
 func TestMergeLabels(t *testing.T) {
 	out := mergeLabels(map[string]string{"a": "1"}, "sched-x")
 	if out["a"] != "1" || out[snapshotv1alpha1.ScheduleLabel] != "sched-x" {
@@ -239,5 +307,188 @@ func TestMergeLabels(t *testing.T) {
 	// schedule label always wins / is set even with nil template labels.
 	if got := mergeLabels(nil, "s")[snapshotv1alpha1.ScheduleLabel]; got != "s" {
 		t.Errorf("schedule label not set on nil template labels; got %q", got)
+	}
+}
+
+func readyCond(t *testing.T, c client.Client) *metav1.Condition {
+	t.Helper()
+	var s snapshotv1alpha1.SwiftSnapshotSchedule
+	if err := c.Get(context.Background(), req().NamespacedName, &s); err != nil {
+		t.Fatal(err)
+	}
+	return apimeta.FindStatusCondition(s.Status.Conditions, snapshotv1alpha1.SwiftSnapshotScheduleConditionReady)
+}
+
+// The defect the Ready condition exists for.
+//
+// An unparseable spec.schedule was logged and dropped: nothing in spec or
+// status changed, so the object read as perfectly healthy under `kubectl get`
+// and silently never fired. The validating webhook that would reject it is off
+// by default, which makes the controller the path a malformed schedule
+// actually reaches.
+func TestReconcile_InvalidSchedule_SurfacesReadyFalse(t *testing.T) {
+	sched := schedule(func(s *snapshotv1alpha1.SwiftSnapshotSchedule) {
+		s.Generation = 4
+		s.Spec.Schedule = "not a cron"
+	})
+	r, c := newSched(t, baseTime, sched)
+	res, err := r.Reconcile(context.Background(), req())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Still no hot-loop — the fix is visibility, not retry. The schedule is
+	// re-reconciled by its own watch when the spec is corrected.
+	if res.RequeueAfter != 0 {
+		t.Errorf("requeue = %v, want 0", res.RequeueAfter)
+	}
+	if n := len(listSnaps(t, c)); n != 0 {
+		t.Errorf("invalid schedule must not create snapshots; got %d", n)
+	}
+
+	cond := readyCond(t, c)
+	if cond == nil {
+		t.Fatal("no Ready condition — an invalid schedule is invisible again")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Ready = %v, want False", cond.Status)
+	}
+	if cond.Reason != "InvalidSchedule" {
+		t.Errorf("reason = %q, want InvalidSchedule", cond.Reason)
+	}
+	// The parse error is the only thing that tells an operator what to fix.
+	if !strings.Contains(cond.Message, "not a cron") && cond.Message == "" {
+		t.Errorf("message must carry the parse error, got %q", cond.Message)
+	}
+	if cond.ObservedGeneration != 4 {
+		t.Errorf("observedGeneration = %d, want 4 (must track the spec it judged)", cond.ObservedGeneration)
+	}
+}
+
+func TestReconcile_ValidSchedule_SetsReadyTrue(t *testing.T) {
+	r, c := newSched(t, baseTime, schedule(nil))
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	cond := readyCond(t, c)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %v, want True", cond)
+	}
+	if cond.Reason != "Scheduled" {
+		t.Errorf("reason = %q, want Scheduled", cond.Reason)
+	}
+}
+
+func TestReconcile_Suspend_SetsReadyFalse(t *testing.T) {
+	sched := schedule(func(s *snapshotv1alpha1.SwiftSnapshotSchedule) { s.Spec.Suspend = true })
+	r, c := newSched(t, baseTime, sched)
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	cond := readyCond(t, c)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready = %v, want False", cond)
+	}
+	if cond.Reason != "Suspended" {
+		t.Errorf("reason = %q, want Suspended", cond.Reason)
+	}
+}
+
+// A steady-state reconcile must not write status. persistStatus compares whole
+// statuses, so anything in a condition that varies between two identical
+// reconciles turns every requeue into an API write. Verified red by building the
+// Ready message from time.Now() instead of from spec, which moves the
+// resourceVersion on the second pass.
+//
+// Note this catches wall-clock drift specifically: r.clock() is pinned in tests,
+// so a message derived from the injected clock would stay stable here.
+func TestReconcile_SteadyStateDoesNotRewriteStatus(t *testing.T) {
+	sched := schedule(func(s *snapshotv1alpha1.SwiftSnapshotSchedule) {
+		lt := metav1.NewTime(baseTime)
+		s.Status.LastScheduleTime = &lt // nothing is due at baseTime
+	})
+	r, c := newSched(t, baseTime, sched)
+
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	var first snapshotv1alpha1.SwiftSnapshotSchedule
+	if err := c.Get(context.Background(), req().NamespacedName, &first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatal(err)
+	}
+	var second snapshotv1alpha1.SwiftSnapshotSchedule
+	if err := c.Get(context.Background(), req().NamespacedName, &second); err != nil {
+		t.Fatal(err)
+	}
+	if first.ResourceVersion != second.ResourceVersion {
+		t.Errorf("status rewritten on an idle reconcile: rv %s -> %s",
+			first.ResourceVersion, second.ResourceVersion)
+	}
+}
+
+// A date that never occurs is now rejected at parse time, so it takes the same
+// visible path as a syntax error. Before the guard this schedule created a
+// SwiftSnapshot named "nightly--62135596800" — the zero time in Unix seconds —
+// and put it back one reconcile after an operator deleted it.
+func TestReconcile_ImpossibleDate_SurfacesReadyFalseAndCreatesNothing(t *testing.T) {
+	sched := schedule(func(s *snapshotv1alpha1.SwiftSnapshotSchedule) {
+		s.Spec.Schedule = "0 0 31 4 *" // 31 April
+	})
+	r, c := newSched(t, baseTime, sched)
+	res, err := r.Reconcile(context.Background(), req())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(listSnaps(t, c)); n != 0 {
+		t.Errorf("a schedule that can never fire must create nothing; got %d snapshots", n)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("requeue = %v, want 0 — re-reconciled by its watch when the spec is fixed", res.RequeueAfter)
+	}
+	cond := readyCond(t, c)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "InvalidSchedule" {
+		t.Fatalf("Ready condition = %+v, want False/InvalidSchedule", cond)
+	}
+	if !strings.Contains(cond.Message, "can never fire") {
+		t.Errorf("message must tell the operator the date is the problem, got %q", cond.Message)
+	}
+}
+
+// leapDayPastHorizon returns a schedule and a "now" where cron finds no next
+// occurrence: 29 February from 2097, since 2100 is not a leap year and 2104 is
+// past the five years cron looks ahead.
+//
+// Parse cannot screen this out — the expression is valid and does fire at other
+// times — which is why the reconcile loop guards the zero time itself.
+func leapDayPastHorizon(t *testing.T) (cron.Schedule, time.Time) {
+	t.Helper()
+	sched, err := parseScheduleUTC("0 0 29 2 *")
+	if err != nil {
+		t.Fatalf("29 February must parse: %v", err)
+	}
+	now := time.Date(2097, 3, 1, 0, 0, 0, 0, time.UTC)
+	if !sched.Next(now).IsZero() {
+		t.Fatal("precondition failed: cron found an occurrence, so this no longer tests the zero-time path")
+	}
+	return sched, now
+}
+
+// Without the check the wait is a vast negative that clamps to one second, and
+// the reconciler spins for the lifetime of the object.
+func TestRequeueToNext_NoOccurrenceBacksOff(t *testing.T) {
+	sched, now := leapDayPastHorizon(t)
+	if got := requeueToNext(sched, now); got != maxRequeue {
+		t.Errorf("requeue = %v, want %v (nothing to wait for)", got, maxRequeue)
+	}
+}
+
+// The zero time precedes every "now", so unguarded it reads as permanently due.
+func TestMostRecentDue_NoOccurrenceIsNotDue(t *testing.T) {
+	sched, now := leapDayPastHorizon(t)
+	tick, due := mostRecentDue(sched, now.Add(-24*time.Hour), now)
+	if due {
+		t.Errorf("due = true (tick %v); no occurrence exists, so nothing is due", tick)
 	}
 }

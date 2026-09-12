@@ -52,6 +52,21 @@ pub struct RuntimeIntent {
     /// swiftletd appends core_scheduling=<v> to the CH --cpus arg.
     #[serde(default)]
     pub core_scheduling: Option<String>,
+    /// vCPU placement policy ("static"); absent/empty = unpinned. swiftletd
+    /// computes the concrete vCPU->host-CPU map from the launcher pod's own
+    /// effective cpuset (see `cpuset`), because the controller cannot know
+    /// which CPUs the kubelet will hand this pod.
+    #[serde(default)]
+    pub cpu_pinning: Option<String>,
+    /// SMT sibling-placement policy ("spread"/"pack") used when cpu_pinning is
+    /// set. Absent = spread.
+    #[serde(default)]
+    pub smt_policy: Option<String>,
+    /// Guest-RAM page size in CLOUD HYPERVISOR units ("2M"/"1G"); absent/empty
+    /// = ordinary 4K pages. The Go controller translates the CRD's Kubernetes
+    /// units ("2Mi"/"1Gi"), which CH rejects.
+    #[serde(default)]
+    pub hugepages: Option<String>,
     /// Optional secondary data disk (appears as /dev/vdb in guest).
     /// LEGACY singular field — superseded by `data_disks`. Retained so a
     /// new swiftletd still honors intent JSON written by an older

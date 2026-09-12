@@ -139,6 +139,25 @@ func (r *SwiftMigrationReconciler) handlePreparingLive(
 		return phaseFailure(err.Error(), migrationv1alpha1.FailureReasonOther)
 	}
 
+	// Per-pod scoped grant for the destination launcher (#515).
+	//
+	// The dst pod runs as the guest launcher SA but is NOT named guest.Name —
+	// it is `<guest>-mig-<uid>`, so the SwiftGuest controller's scoped Role does
+	// not cover it. Without this, narrowing the shared namespace-wide binding
+	// would break live migration specifically, and only at the moment a
+	// migration is attempted.
+	//
+	// Owned by the SwiftMigration rather than the guest: the dst pod's lifetime
+	// is the migration's, and on a failed migration the pod (and this grant)
+	// should go with it rather than linger on a guest that never moved.
+	// Deliberately outside the IsNotFound branch so a re-reconcile after a
+	// partial failure re-establishes it; it is idempotent.
+	if err := swiftguest.EnsureScopedLauncherRBAC(
+		ctx, r.Client, r.Scheme, mig, expectedDstName, swiftguest.GuestLauncher,
+	); err != nil {
+		return phaseTransient(fmt.Errorf("ensure scoped dst launcher RBAC: %w", err))
+	}
+
 	var existingDst corev1.Pod
 	getErr := r.Get(ctx, client.ObjectKey{Name: expectedDstName, Namespace: guest.Namespace}, &existingDst)
 	switch {
@@ -162,7 +181,7 @@ func (r *SwiftMigrationReconciler) handlePreparingLive(
 			return phaseTransient(fmt.Errorf("ensure frozen dst intent: %w", frozenErr))
 		}
 		// Resolve the OVN backend's dst-pod identity annotations from the guest
-		// (kube-ovn: the LSP MAC + IP pin + kubevirt.io/migrationJobName so the dst
+		// (kube-ovn: the LSP MAC + IP pin + MigrationJobNameAnnotation so the dst
 		// keeps the src's IP through cutover). Empty for non-OVN guests. Fail closed
 		// on a NAD Get error: a dst that boots without its OVN identity is
 		// unreachable on the segment, so requeue rather than build a broken pod.

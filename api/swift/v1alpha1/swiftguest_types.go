@@ -70,6 +70,15 @@ const ConditionServiceReady = "ServiceReady"
 // the pod-netns signal (the VM's forwarded traffic can bypass the eth0 hook).
 const ConditionEgressReady = "EgressReady"
 
+// ConditionNetworkReady reports whether the guest obtained an IP (#527).
+//
+// It exists because "Running with no IP" was previously indistinguishable from
+// "Running, still booting" — forever. The lease poller gave up after ~4 minutes
+// with only a launcher-log warning, so a guest whose NIC never came up looked
+// completely healthy on the CR. False here means the poller timed out with no
+// DHCP lease; the message carries the likely cause.
+const ConditionNetworkReady = "NetworkReady"
+
 // SwiftGuestPhase is the phase of a SwiftGuest.
 // +kubebuilder:validation:Enum=Pending;Scheduling;Running;Stopped;Failed
 type SwiftGuestPhase string
@@ -185,6 +194,27 @@ type SwiftGuestSpec struct {
 	// refuses to build with a Resolved=False condition if they disagree.
 	// +optional
 	NodeName string `json:"nodeName,omitempty"`
+	// SchedulerName routes the launcher pod to a specific kube-scheduler
+	// profile (pod.spec.schedulerName). Empty means the cluster default.
+	//
+	// The launcher pod already carries accurate requests — cpu equal to the
+	// guest's vCPU count and memory equal to guest RAM plus the launcher
+	// overhead, with requests == limits — so the scheduler scores nodes on
+	// the guest's real footprint. What the default profile does NOT let an
+	// operator choose is how heavily free capacity weighs against the other
+	// scoring terms. A profile configured with the NodeResourcesFit
+	// LeastAllocated strategy biases placement toward less-loaded nodes;
+	// naming it here is how a guest (or every replica of a pool, via the
+	// pool template) opts into it.
+	//
+	// This is placement policy, not placement: an unknown scheduler name
+	// leaves the pod Pending forever, because no scheduler claims it. Set it
+	// only to a profile that exists in the cluster's scheduler config.
+	//
+	// Ignored when NodeName is set — direct binding bypasses the scheduler
+	// entirely, so no profile ever sees the pod.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
 	// Migration is the per-guest migration policy. If nil, migration is
 	// permitted with default settings (preferredMode: auto). Set
 	// migration.enabled=false to pin a guest in place — the SwiftMigration
@@ -653,6 +683,12 @@ type GuestInterface struct {
 	Socket string `json:"socket,omitempty"`
 	// MAC optionally pins the interface MAC address. When empty a deterministic
 	// MAC is generated. Honored for vhost-user (and bridge) interfaces.
+	//
+	// Constrained to a canonical colon-separated MAC. This is a security
+	// boundary, not cosmetics: network-init.sh writes the value into a shell
+	// env file that launcher-entrypoint.sh SOURCES, so an unconstrained value
+	// containing $(...) would execute in the privileged launcher container.
+	// +kubebuilder:validation:Pattern=`^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$`
 	// +optional
 	MAC string `json:"mac,omitempty"`
 }
@@ -690,7 +726,7 @@ type GuestNetworkInterface struct {
 type GuestNetworkSpec struct {
 	// Binding selects the primary interface's relationship to the pod network:
 	//   nat    (default) — VM behind the pod IP; ports are Service-exposable via
-	//                      an in-pod DNAT (KubeVirt masquerade model).
+	//                      an in-pod DNAT (the masquerade model).
 	//   bridge          — primary rides a multi-node-L2 NAD (portable IP); ports
 	//                      are NOT in-pod-DNAT'd (they reach the NAD IP). expose
 	//                      is rejected for bridge; ports without expose are

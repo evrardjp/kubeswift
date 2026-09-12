@@ -40,6 +40,7 @@ func BuildPod(guest *swiftv1alpha1.SwiftGuest, rg *resolved.ResolvedGuest, seedC
 	}
 	applyTopologyConstraints(pod, guest)
 	applyNodeName(pod, guest)
+	applySchedulerName(pod, guest)
 	applyDataDiskRefs(pod, guest)
 	applyFilesystems(pod, guest)
 	applyVhostUserSocketVolumes(pod, guest)
@@ -276,6 +277,22 @@ func applyNodeName(pod *corev1.Pod, guest *swiftv1alpha1.SwiftGuest) {
 	}
 }
 
+// applySchedulerName routes the launcher pod to a named kube-scheduler
+// profile. The launcher's requests already describe the guest's real
+// footprint (vCPU + RAM + overhead, requests == limits), so a profile using
+// the NodeResourcesFit LeastAllocated strategy will bias replicas toward
+// less-loaded nodes; this is how a guest opts into such a profile.
+//
+// NodeName wins: direct binding skips the scheduler entirely, so writing a
+// schedulerName alongside it would be inert configuration that reads as if
+// it did something. Leave the field empty in that case so the pod spec says
+// what actually happened.
+func applySchedulerName(pod *corev1.Pod, guest *swiftv1alpha1.SwiftGuest) {
+	if guest.Spec.SchedulerName != "" && guest.Spec.NodeName == "" {
+		pod.Spec.SchedulerName = guest.Spec.SchedulerName
+	}
+}
+
 // applyDataDiskRefs adds PVC volumes and mounts for dataDiskRefs with pvcRef.
 // ImageRef-backed dataDiskRefs are resolved by the resolver, not here.
 // applyDataDiskRefs mounts plain pvcRef data disks (no attachAsDisk) as
@@ -459,6 +476,13 @@ func buildKernelBootPod(guest *swiftv1alpha1.SwiftGuest, rg *resolved.ResolvedGu
 	}
 	AddSRIOVResourceLimits(&resources, guest)
 
+	// Hugepage-backed guest RAM moves the guest's memory from `memory` to
+	// `hugepages-<size>` and hands the launcher a hugetlbfs mount.
+	if hpVol, hpMount := applyHugepages(&resources, rg, mem); hpVol != nil {
+		volumes = append(volumes, *hpVol)
+		mounts = append(mounts, *hpMount)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        guest.Name,
@@ -467,8 +491,12 @@ func buildKernelBootPod(guest *swiftv1alpha1.SwiftGuest, rg *resolved.ResolvedGu
 			Labels:      podLabels(guest),
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:  corev1.RestartPolicyNever,
-			InitContainers: initContainers,
+			// Without this the pod silently inherits `default`, and loses its
+			// grant the moment the legacy subject retires (#443).
+			ServiceAccountName: LauncherServiceAccountFor(GuestLauncher),
+			ImagePullSecrets:   LauncherImagePullSecrets(),
+			RestartPolicy:      corev1.RestartPolicyNever,
+			InitContainers:     initContainers,
 			NodeSelector: map[string]string{
 				"kubeswift.io/kernel-node": "true",
 			},
@@ -584,6 +612,13 @@ func buildDiskBootPod(guest *swiftv1alpha1.SwiftGuest, rg *resolved.ResolvedGues
 	}
 	AddSRIOVResourceLimits(&resources, guest)
 
+	// Hugepage-backed guest RAM moves the guest's memory from `memory` to
+	// `hugepages-<size>` and hands the launcher a hugetlbfs mount.
+	if hpVol, hpMount := applyHugepages(&resources, rg, mem); hpVol != nil {
+		volumes = append(volumes, *hpVol)
+		mounts = append(mounts, *hpMount)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        guest.Name,
@@ -592,8 +627,12 @@ func buildDiskBootPod(guest *swiftv1alpha1.SwiftGuest, rg *resolved.ResolvedGues
 			Labels:      podLabels(guest),
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:  corev1.RestartPolicyNever,
-			InitContainers: initContainers,
+			// Without this the pod silently inherits `default`, and loses its
+			// grant the moment the legacy subject retires (#443).
+			ServiceAccountName: LauncherServiceAccountFor(GuestLauncher),
+			ImagePullSecrets:   LauncherImagePullSecrets(),
+			RestartPolicy:      corev1.RestartPolicyNever,
+			InitContainers:     initContainers,
 			Containers: []corev1.Container{
 				{
 					Name:            "launcher",
@@ -685,15 +724,20 @@ func AddVolumeMounts(mounts *[]corev1.VolumeMount, devices *[]corev1.VolumeDevic
 	}
 }
 
-// AddSeedVolume adds the seed ConfigMap volume to the pod. Use when ResolvedGuest has Seed.
-// ConfigMap name should be guestName + SeedConfigMapSuffix.
-func AddSeedVolume(volumes *[]corev1.Volume, configMapName string) {
+// AddSeedVolume adds the rendered seed volume to the pod. Use when
+// ResolvedGuest has Seed. The name is guestName + SeedConfigMapSuffix.
+//
+// This is a SECRET, not a ConfigMap. cloud-init user-data routinely carries SSH
+// keys, passwords and join tokens, and a SwiftSeedProfile can source it from a
+// Secret via valueFrom.secretKeyRef — which the controller then rendered into a
+// ConfigMap, re-materializing the credential in the clear for anyone with `get
+// configmaps` in the namespace. Same three keys, same mount path, so the guest
+// side is unchanged.
+func AddSeedVolume(volumes *[]corev1.Volume, seedName string) {
 	*volumes = append(*volumes, corev1.Volume{
 		Name: "seed",
 		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{Name: configMapName},
-			},
+			Secret: &corev1.SecretVolumeSource{SecretName: seedName},
 		},
 	})
 }

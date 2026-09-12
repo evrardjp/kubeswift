@@ -1,6 +1,6 @@
 # Multi-stage build for snapshot-oras (the OCI-registry / ORAS snapshot
 # uploader/downloader for the SwiftSnapshot "oci" backend).
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 WORKDIR /build
 
 ARG VERSION=dev
@@ -23,7 +23,27 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 # Fetch a pinned cosign for provenance signing (P2). Verified against the
 # release checksums file so a tampered/corrupt binary fails the build.
-ARG COSIGN_VERSION=v2.4.1
+#
+# 3.x, matching sandbox-materialize. This image SIGNS, which is why it stayed on
+# 2.x longer than the verifier did (#486):
+#
+# cosign 3.x rejects `--tlog-upload=false`, the flag internal/oci.SignArgs used
+# to sign offline. The trap is that simply dropping the flag "works" — cosign
+# exits 0 — while uploading the artifact digest to the PUBLIC Rekor. Measured:
+# a signature made that way carries tlogEntries=1 with a real public logIndex.
+# For a private snapshot or an air-gapped golden image that is a disclosure, not
+# a convenience.
+#
+# SignArgs therefore passes `--signing-config` with a config declaring no
+# transparency-log service (embedded at internal/oci/signing-config.json,
+# verified to produce tlogEntries=0). It picks the dialect from the cosign major
+# it finds at run time, so `swiftctl image publish` still works against an
+# operator's own 2.x install, and REFUSES to sign on 3.x if it cannot supply the
+# config rather than quietly logging the digest.
+#
+# Signatures made either way verify with both majors — that is what
+# hack/cosign-interop.sh exists to prove, and it is the gate on changing this.
+ARG COSIGN_VERSION=v3.1.3
 RUN cd /tmp \
     && curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o cosign-linux-amd64 \
     && curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign_checksums.txt" -o cosign_checksums.txt \

@@ -4,6 +4,1080 @@ All notable changes to KubeSwift are documented here.
 
 ---
 
+## [v0.13.14] — 2026-09-11
+
+A bug-fix release for scheduled snapshots. Three separate defects in
+`SwiftSnapshotSchedule`, each of which let a schedule stop doing its job without
+saying so: a cron expression evaluated in the wrong timezone, a parser panic on
+one input shape, and an unparseable schedule that was logged and discarded.
+
+Also moves the chart's console to kubeswift-ui v0.12.4, which clears every
+outstanding npm advisory in the UI (27 to 0, including an Angular i18n XSS and a
+cache-key ambiguity that leaked responses across requests).
+
+**One CRD gains a print column.** No new fields, so a stale schema drops
+nothing -- but `kubectl get sss` will not show READY until you apply the CRDs.
+
+### Upgrade
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.14 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # for the READY column on schedules
+```
+
+`ui.image.tag` moves from `v0.12.3` to `v0.12.4`. No values keys were added or
+removed.
+
+### Fixed
+
+- **Schedules ran on the pod's local wall-clock, not UTC** (#580).
+  `spec.schedule` is documented as UTC in the Go type, `docs/crds.md` and the
+  guide, but `cron.ParseStandard` leaves an unzoned expression at `time.Local`
+  and `metav1.Time` decodes to local, so `Next()` evaluated every schedule
+  locally. Under `Europe/Rome`, `0 2 * * *` fired at 00:00 UTC and shifted again
+  across DST; with `startingDeadlineSeconds` set, a displaced tick is skipped --
+  so the snapshot is not late, it is missing. The shipped distroless image
+  carries no tzdata and resolves `time.Local` to UTC, so a default install was
+  unaffected; a mounted `/etc/localtime`, a different base image, or running
+  outside a container was not. A `CRON_TZ=`/`TZ=` prefix still selects another
+  zone.
+
+- **A `TZ=` prefix with no cron fields panicked the controller** (#583).
+  cron v3.0.1 extracts the zone with `spec[eq+1:i]`, where `i` is the index of
+  the first space; with no space `i` is -1 and the slice panics with
+  `slice bounds out of range [:-1]`. `spec.schedule` is user-supplied, so
+  `TZ=Europe/Rome` with nothing after it reached that line straight from a CR.
+  The controller and the webhook now parse through one guarded helper, so a
+  check added to one cannot miss the other. Reported upstream as
+  `robfig/cron#470` (also `robfig/cron#566`, `robfig/cron#574`), all still open,
+  with the project last pushed in July 2024 -- so guarding locally is the fix,
+  not a stopgap.
+
+- **An unparseable schedule was logged and dropped** (#584). The reconciler
+  returned without touching status, so the object read as healthy under
+  `kubectl get` -- schedule, suspend, guest and age all populated -- and simply
+  never fired. A schedule now reports a `Ready` condition (`Scheduled`,
+  `InvalidSchedule` or `Suspended`) carrying the parse error in its message,
+  surfaced as a `READY` print column. The `Conditions` field and its `Ready`
+  constant had been declared and documented since the kind shipped, and
+  populated nowhere.
+
+### Changed
+
+- `ui.image.tag` now defaults to `v0.12.4` (was `v0.12.3`).
+- `sigs.k8s.io/controller-runtime` 0.24.1 to 0.25.0 (#577); and
+  `go-containerregistry` 0.22.1, `docker/cli` 29.8.0, `go-jose/v4` 4.1.5,
+  `golang.org/x/crypto` 0.56.0 (#578). govulncheck reports no reachable
+  vulnerabilities and the image scan is clean.
+
+### Docs
+
+- `ADOPTERS.md` and `CONTRIBUTING.md` (#579).
+- The UTC wording on `spec.schedule` is now unambiguous and the `CRON_TZ=`
+  escape hatch is documented (#582).
+- Install commands are checked against the chart version by
+  `hack/verify-doc-versions.sh`, after the README and eight pages sat three
+  releases behind (#576).
+- `docs/snapshots/scheduled-snapshots.md` gains a Status section for the new
+  condition, and the claim that the webhook validates the cron expression up
+  front is corrected -- that holds only when `webhook.enabled` is on, which by
+  default it is not.
+
+---
+
+## [v0.13.13] — 2026-09-05
+
+A feature release: guests can now be pinned to dedicated host CPUs and backed
+by hugepages, both set on the guest class. Also clears the two fixable HIGH
+CVEs that had failed the nightly image scan every night since 2026-08-30, and
+moves the whole build onto Go 1.27.
+
+**Two new SwiftGuestClass fields, so `helm upgrade` alone does not deliver
+them.** Helm treats `crds/` as install-only.
+
+### Upgrade
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.13 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # REQUIRED this release — the new fields live here
+```
+
+One CRD gains fields (`swiftguestclasses.swift.kubeswift.io`). No values keys
+added or removed. Every new field defaults to today's behaviour, so existing
+guest classes are unchanged and need no edit: `cpuPinning` defaults to `none`
+and `hugepages` to unset, which emit byte-identical Cloud Hypervisor arguments
+to v0.13.12.
+
+### Added
+
+- **vCPU pinning and SMT placement** (#566). `SwiftGuestClass.spec.cpuPinning:
+  static` pins each vCPU to one host CPU, and `smtPolicy` (`spread`/`pack`)
+  chooses which hyper-thread siblings it uses — rendered as Cloud Hypervisor
+  `--cpus affinity=`.
+
+  The map is computed in swiftletd from the **launcher pod's own effective
+  cpuset**, not controller-side from node topology. Under the kubelet CPU
+  Manager `static` policy a pod's exclusive CPUs are assigned at admission,
+  after the controller has written the runtime intent, so a CPU chosen earlier
+  falls outside the pod's cgroup and is clamped or rejected — the guest would
+  run unpinned while still reporting as pinned. Reading the cpuset at launch is
+  correct under both policies. A cpuset smaller than the vCPU count fails the
+  launch with an explicit message rather than pinning partially.
+  [`docs/performance/cpu-pinning.md`](docs/performance/cpu-pinning.md).
+
+- **Hugepage-backed guest memory** (#569). `SwiftGuestClass.spec.hugepages`
+  (`2Mi`/`1Gi`) backs guest RAM with hugepages via `--memory hugepages=on`.
+
+  Guest RAM **moves** to the `hugepages-<size>` resource rather than being
+  requested twice: the kubelet already subtracts reserved hugepages from the
+  node's allocatable memory, so a pod booking both would consume twice the
+  guest's RAM and stop scheduling long before the pages ran out. The launcher
+  requests the guest's memory as hugepages plus only its own overhead as
+  ordinary memory, and gets a size-qualified `emptyDir` at `/dev/hugepages`.
+  A class requesting a size the node has not reserved does not schedule — the
+  failure is visible, and it happens before any VM starts.
+  [`docs/performance/hugepages.md`](docs/performance/hugepages.md).
+
+- **`cosign freshness` CI job** (#574). Checks the pinned cosign against the
+  latest upstream release and that the images agree with each other.
+  `COSIGN_VERSION` is a Containerfile `ARG`, invisible to Dependabot, so the
+  pin previously had no watcher at all.
+
+### Fixed
+
+- **Two fixable HIGH CVEs that had failed the nightly image scan since
+  2026-08-30** (#567). `kubeswift-dra-driver` carried
+  `google.golang.org/grpc` CVE-2026-84304, and `migration-stunnel` carried
+  `libcrypto3`/`libssl3` CVE-2026-14456.
+
+  Neither would have fixed itself. grpc is an **indirect** requirement, and
+  Dependabot only proposed direct ones. libcrypto3 lives in the **base layer**,
+  outside stunnel's dependency closure, and `apk add` leaves an
+  already-installed package at whatever version the base image froze — the
+  fixed package sat in the Alpine repo the whole time and no rebuild would ever
+  have picked it up. The image now runs `apk upgrade` before installing, which
+  closes the class rather than the instance.
+
+- **DRA driver did not compile against k8s.io 0.37** (#568).
+  `kubeletplugin.DRAPlugin` gained `WatchHealthStatus`. The driver declines
+  health reporting with `ErrHealthNotSupported` rather than reporting a
+  hardcoded `Healthy`: answering that call promises the kubelet a fresh report
+  inside each device's `HealthCheckTimeout`, so a GPU whose vfio-pci binding
+  had gone would keep reading as usable. A compile-time interface assertion now
+  makes the next such change fail on the type rather than at a call site.
+
+- **`golang.org/x/mod` CVE-2026-56864/56865** (#568), pulled in transitively by
+  the k8s 0.37 bump.
+
+### Changed
+
+- **All nine images build on Go 1.27** (#549–#556), and swiftletd's Rust
+  builder moves to 1.98 (#563).
+- **Dependabot can see indirect Go dependencies, and the `kubernetes` group
+  actually fires** (#570). That group had existed since Phase 1 without ever
+  producing a PR — every `k8s.io` bump arrived inside `go-minor-patch`
+  instead, so an API-breaking Kubernetes minor shipped alongside routine
+  patches. Both catch-all groups now exclude what their paired specific group
+  owns, which is correct regardless of group evaluation order.
+- **Trivy's report pass skips the vendored cosign binary** (#574). It was
+  uploading 16 permanently-unactionable alerts describing sigstore's build
+  rather than ours — the clearest being an `x/crypto` CRITICAL reporting
+  v0.53.0 while KubeSwift's own module graph was already on the fixed v0.55.0.
+  The gate had skipped that file all along.
+- Third-party project references removed across the tree (#548, #560). CRD
+  descriptions only; no schema change.
+
+## [v0.13.12] — 2026-08-24
+
+A bug-fix release, and the headline is that a documented feature has never
+worked on any released version. `SwiftSeedProfile.spec.userDataFrom` — the
+Secret-backed seed path, which is what the docs tell you to use so cloud-init
+credentials stay out of Git — was rejected by the apiserver on every version up
+to and including v0.13.11.
+
+**The fix is a CRD schema change, so `helm upgrade` alone does not deliver it.**
+Helm treats `crds/` as install-only, with no flag to change that.
+
+### Upgrade
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.12 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # REQUIRED this release — the CRD *is* the fix
+```
+
+One CRD changes (`swiftseedprofiles.seed.kubeswift.io`). No values keys added or
+removed, no controller behaviour change, no image changes beyond the routine
+dependency bumps below. The schema change only *relaxes* a constraint, so
+existing SwiftSeedProfiles remain valid and need no edit.
+
+### Fixed
+- **`SwiftSeedProfile.spec.userDataFrom` was impossible to use** (#546).
+  `UserData` was a bare required field in the schema, so the apiserver rejected
+  every `userDataFrom`-only profile with `spec.userData: Required value` —
+  *before* admission ran, which meant the validating webhook's own (correct)
+  either-or check never saw the object. The path was implemented end to end
+  (`internal/seed/render.go`, `internal/resolved/merge.go`), shipped a sample,
+  and is what `docs/gitops/secrets.md` recommends; none of it was reachable. The
+  Go type had said so since it was written: `// Inline; use UserDataFrom for
+  ref`.
+
+  `userData` becomes optional and the either-or moves into a CEL
+  `XValidation` rule on the spec, so it is enforced in-tree by the apiserver
+  rather than by the webhook — which matters because `webhook.enabled` is
+  `false` by default, and a rule that only holds when the webhook is on is not a
+  rule. Verified on a cluster in all four cases: neither field rejected,
+  `userData` alone accepted, `userDataFrom` alone accepted (previously
+  impossible), and `userData: ""` rejected.
+
+  Found by validating every shipped manifest against the CRD schemas
+  *client-side*. That is the configuration the defect lives in: `kubectl apply
+  --dry-run=server` against a webhook-enabled cluster cannot see this class,
+  because the defaulting webhook papers over it.
+
+- **The chart rendered image tags as `vv0.13.11` when used from a checkout**
+  (#545). `Chart.yaml` carried `appVersion: "v0.13.11"` and `kubeswift.imageTag`
+  prepends `v`, producing a tag that was never published — for the controller
+  and for the five launcher images it passes on by env var, so an affected
+  install would fail to start VMs, not merely fail to start. **Released charts
+  were never affected**: the release workflows package with
+  `--app-version "${TAG#v}"`, and the flag wins over the file. Only
+  `helm install ./charts/kubeswift`, `helm template` for review, and
+  install-from-source were hit, which is how it survived several releases.
+
+  Fixed in three places, because the value alone would be correct only until the
+  next hand-edit: the value is bare with the constraint written at the point of
+  edit, `imageTag` trims a stray leading `v`, and `hack/verify-image-tags.sh`
+  fails the build on any rendered tag that is not `vX.Y.Z`, `sha-<hex>` or
+  `latest`. Nothing else in the manifests job covered this — kubeconform checks
+  schema, kube-linter checks policy, and a nonexistent tag is valid under both.
+
+- **`config/samples/golden-image/swiftimage-oci.yaml` could not apply without
+  the webhook** (#546). It omitted `spec.format`, which is required in the
+  schema and supplied only by the defaulting webhook, so it worked on a default
+  install and was rejected wherever `webhook.enabled=false`. Now set explicitly.
+
+### Changed
+- `golang.org/x/net` 0.57.0 → 0.58.0 and `google.golang.org/protobuf` to the
+  1.36.12 release (#536, #537). Routine grouped bumps, no security advisory;
+  govulncheck reports no affecting vulnerabilities.
+- CI action pins moved forward (#538, #539, #542, #543). The
+  `github/codeql-action/*` sub-actions are now grouped for Dependabot: they must
+  share a version or `analyze` refuses the config `init` wrote, and ungrouped
+  they arrived one at a time, red on arrival. Twice.
+
+### Documentation
+- **GitOps docs refreshed for v0.13.x** (#544), having last been written at
+  v0.5. The three-layer model covered six of the fifteen CRDs; it now covers all
+  of them, plus the inverse — the kinds that must *not* be committed, because
+  roughly half the CRD surface is one-shot or controller-owned and Git-managing
+  it produces a reconcile loop rather than a mess.
+- **`docs/gitops/oci-artifacts.md`** — the registry as the artifact store. Four
+  artifact types come out of one registry: the chart, a golden VM disk
+  (`SwiftImage.spec.source.oci`), a kernel (`SwiftKernel.spec.ociRef`), and VM
+  snapshots pushed back out (`SwiftSnapshot` `backend.type: oci`). Digest-pin
+  them for the same reason you pin the chart.
+- The Flux reference repo gains a golden OCI image, a kernel, snapshot schedules
+  (CSI and OCI) and a warm sandbox pool, and its chart pin moves off
+  `semver: ">=0.1.0"` — which on a pre-1.0 project with `v1alpha1` APIs let a
+  reconciler roll the platform across a breaking minor unattended.
+
+## [v0.13.11] — 2026-08-16
+
+### Fixed
+- **Rook Ceph RBD is usable end to end** (#532). Two defects, both of which left
+  a guest broken while reporting nothing wrong. Neither is Ceph-specific in
+  origin — Ceph *enforces* where Longhorn tolerates, so it is the driver that
+  exposed them.
+  - `cloneStrategy: snapshot` silently produced an **unbootable Block root
+    disk**. A CSI VolumeSnapshot clones the source *volume*, and the SwiftImage
+    import PVC is Filesystem-mode holding the disk as a file inside it, so
+    cloning it into a Block root disk yields a block device whose content is a
+    filesystem. `clone-grow-init`'s `sgdisk -e` then found no GPT and wrote a
+    fresh empty one. Drivers honouring `allow-volume-mode-change` bind the PVC
+    happily, so the guest reached `Running` with `StorageReady=True` and never
+    booted. The clone path now compares the image PVC's volumeMode against the
+    resolved root-disk volumeMode and falls back to the copy path when they
+    differ, logging why. Matching modes keep the CoW path. This had made every
+    RWX+Block class — the shape live migration requires — unusable with a
+    snapshot-strategy image.
+  - **Restore always provisioned RWO+Filesystem** regardless of the source disk,
+    so restoring a Block+RWX guest asked the driver to reinterpret the snapshot
+    bytes. Ceph refuses the mode change and the PVC never bound, leaving
+    `SwiftRestore` in `Restoring` indefinitely; once forced past that the
+    launcher failed permanently with `volume root-disk has volumeMode
+    Filesystem, but is specified in volumeDevices`. The restore now reproduces
+    the source disk's accessMode, volumeMode and storageClass.
+
+### Added
+- **`SwiftImage.spec.importStorageClassName`** (#534, closes #533) — selects the
+  storage class for the import PVC. Empty keeps the previous behaviour (cluster
+  default StorageClass), so existing images are unaffected. Without it an image
+  was pinned to the default backend, and since `cloneStorageClassName` defaults
+  to the import PVC's class, so were its guests — the only workaround was
+  flipping the cluster-wide default around the import. Immutable once the import
+  has started, since a bound PVC's storage class cannot change.
+
+### Changed
+- Clone-strategy compatibility matrix records Rook Ceph RBD as validated, with
+  the Block-mode caveat (#531).
+
+## [v0.13.10] — 2026-08-14
+
+An observability-and-hygiene release. A guest that never gets an IP now says why
+instead of looking healthy forever; per-launcher-pod RBAC covers every launcher
+class; swiftletd moves four majors of kube-rs and sheds 26 crates.
+
+No CRD schema changes, no API changes. One new values key
+(`scopedLauncherRBAC.enabled`, default `false`).
+
+### Upgrade
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.10 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # helm does not upgrade CRDs
+```
+
+The controller ClusterRole gains `roles` and `delete` on `rolebindings` (needed
+by `scopedLauncherRBAC`). `helm upgrade` applies it; a controller image newer
+than its ClusterRole logs the failure and keeps running rather than blocking
+workloads.
+
+### Fixed
+
+- **A guest that never gets an IP now says so** (#527). `NetworkReady=False` with
+  reason `DHCPTimeout` appears on the SwiftGuest once swiftletd's lease poller
+  gives up, instead of the guest sitting at `Running` / `GuestRunning=True` with
+  an empty `status.network.primaryIP` indefinitely.
+
+  Previously the timeout was a single `log::warn!("lease_poll_timeout")` in the
+  launcher and nothing else — nothing on the CR distinguished "never going to get
+  an IP" from "still booting", so diagnosing it meant reading launcher logs and
+  attaching to a serial console.
+
+  The condition message names the likely cause. The common one is knowable from
+  the spec: a **disk-boot guest with no `seedProfileRef` gets no NoCloud seed**,
+  so cloud-init finds no datasource, never writes netplan, and the interface is
+  never configured — the guest boots fine to `multi-user.target` and simply never
+  sends a DHCP request. That case now reads:
+
+  > no DHCP lease after 240s; the guest booted but never requested one. This
+  > guest is disk-boot with no seedProfileRef, so it gets no NoCloud seed:
+  > cloud-init finds no datasource, never writes netplan, and the interface is
+  > never configured. Set spec.seedProfileRef, or use an image that configures
+  > its own networking
+
+  The condition recovers to `True` if a lease arrives late, so it never latches
+  false. Deliberately **not** a webhook rejection of "disk-boot without a seed" —
+  an image that self-configures is a valid shape; the goal is visibility, not
+  prohibition. No CRD schema change (conditions are not schema).
+
+### Changed
+
+- **Lab infrastructure names replaced with placeholders across tests, samples
+  and docs** (#529). Node names are now `worker-1` / `worker-2` / `cp-1`, fleet
+  members `edge-1` / `edge-2` / `edge-3`, and the external-API-server example
+  `k8s-api.example.com`. 95 files, 800 insertions and 800 deletions — a pure
+  rename with no behaviour, logic or schema change. Affects nothing at run time;
+  listed because sample manifests and docs an operator copies from now use the
+  placeholder names.
+
+- **swiftletd: kube-rs 0.92 → 4.2, k8s-openapi 0.22 → 0.28** (#499, #501). Four
+  majors of kube-rs, no source changes required: swiftletd only uses the stable
+  core of the client — `Api::namespaced`, `patch`, `patch_status`, a
+  `DynamicObject` for the one `GuestRunning` status patch, and
+  `Config::incluster_dns` — and none of those changed signature.
+
+  The `runtime` and `derive` features were enabled but never used by a single
+  line; swiftletd is a launcher, not a controller. Dropping them removes
+  `kube-runtime`, `kube-derive`, `schemars`, `serde_yaml`, `json-patch`,
+  `parking_lot`, `rand`, `backoff` and their subtrees — **237 → 211 unique
+  crates** (51 removed, 25 added).
+
+  `k8s-openapi` moves to the `v1_34` feature, matching the fleet, instead of
+  trailing it by six minors on `v1_28`. Only `core/v1 Pod` is used.
+
+  Two behaviour notes, neither of which affects the shipped path: kube 4.x adds
+  an OS-native trust-store fallback via `rustls-platform-verifier`, which engages
+  only when no CA is configured — `incluster_dns` always supplies the
+  service-account CA, so the shipped path is unchanged. And `Client::try_from`
+  now requires a Tokio reactor; `create_client` is async, so it always has one.
+  A unit test pins both, plus the rustls-0.23 crypto-provider trap that would
+  otherwise be a runtime panic on first status write.
+
+### Security
+
+- **Per-launcher-pod scoped RBAC** (#515), behind `scopedLauncherRBAC.enabled`
+  (default `false`). Every launcher pod — SwiftGuest, migration target,
+  SwiftSandbox, and warm pool slot — now gets its own Role + RoleBinding
+  granting `pods: get,patch` on **exactly its own pod** (and, for a guest,
+  `swiftguests/status` on its own CR). Enabling the gate retires the shared
+  namespace-wide RoleBinding, leaving those per-pod grants as the only access.
+
+  This is **defence in depth, not the fix for #443**. RBAC is additive and the
+  launcher ServiceAccount is shared, so scoping alone cannot stop an attacker who
+  obtains the SA — the ValidatingAdmissionPolicy (`launcherSAGate`, v0.13.8) is
+  what does. This bounds what the token is worth if it leaks another way.
+
+  Scope was validated before the mechanism was built: a guest ran its full
+  lifecycle on a live cluster under a hand-made self-only Role — boot, IP
+  discovery, status reporting, stop — with zero RBAC denials, while
+  `patch pod/<other>` was denied.
+
+  A sandbox launcher is granted **no** `swiftguests/status`: it runs untrusted
+  code and has no SwiftGuest CR to report to, so granting it would let an escaped
+  sandbox forge guest status.
+
+  Warm pool slots take two phases, because a slot pod is created by the pool but
+  re-parented to a SwiftSandbox on checkout, so neither CR owns it for its whole
+  life. The pool creates the grant owned by itself (the pod does not exist yet,
+  and the grant must precede it), then hands ownership to the slot pod, which is
+  the only owner whose lifetime matches. A pool also converges grants for slots
+  it already has, so enabling the gate on a running pool does not cut off live
+  slots.
+
+  Object cost is two per launcher pod, garbage-collected with it. Failure to
+  retire the shared binding is logged at ERROR and never blocks a workload from
+  booting — the exposure in that case is exactly the pre-change posture.
+
+  Requires `roles` and `delete` on `rolebindings` in the controller ClusterRole;
+  `helm upgrade` covers this, but a controller image newer than its ClusterRole
+  will log the failure and keep running.
+
+---
+
+## [v0.13.9] — 2026-08-14
+
+A supply-chain release. Both cosign-bearing images drop from **48 fixable CVEs
+(1 critical, 24 high) to 4 (0 critical, 3 high)**, the Go toolchain picks up 7
+standard-library fixes, and a signing behaviour that could have leaked private
+artifact digests is now caught by a test rather than shipped quietly.
+
+No CRD schema changes, no API changes, no values changes.
+
+### Upgrade
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.9 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # helm does not upgrade CRDs
+```
+
+### Security
+
+- **cosign 2.6.5 → 3.1.3 in `sandbox-materialize` and `snapshot-oras`** (#486).
+  48 fixable CVEs → 4 on each image, measured on the built images; the critical
+  is gone. The four that remain are inside cosign's own build.
+
+  Both images were pinned to 2.x because 3.x rejects `--tlog-upload=false`, the
+  flag used to sign offline. **Dropping that flag is not the fix**: cosign 3.x
+  then signs successfully, exits 0, and uploads the artifact digest to the
+  **public Rekor**. For a private VM snapshot or an air-gapped golden image that
+  is a disclosure. The signer now passes a signing-config declaring no
+  transparency-log service, selects the dialect from the cosign major found at
+  run time (so `swiftctl image publish` still works against an operator's own
+  2.x install), and **refuses to sign** rather than falling back to the
+  silent-upload form.
+
+  Existing v2.6.5 signatures keep verifying. `hack/cosign-interop.sh` proves it
+  across both majors in both directions, with negative controls, and fails on
+  any transparency-log entry.
+
+- **go 1.26.5 → 1.26.6** — 7 standard-library advisories reachable from our code
+  (`net/url`, `html/template`, `crypto/tls`, `net/http`, `encoding/xml`,
+  `encoding/asn1`). Not a regression from any change here: the same commit
+  passed `govulncheck` and then failed it hours later on a database update.
+
+### Fixed
+
+- **swiftletd no longer logs a 403 at every sandbox exit** (#519). It was trying
+  to patch a `SwiftGuest` CR that does not exist for a sandbox. Cosmetic —
+  sandbox status was always reported correctly — but it named an RBAC denial on
+  every run, which invites granting the privileged launcher ServiceAccount
+  `swiftguests/status`. The existing `KUBESWIFT_REPORT_GUEST_CR` switch was
+  applied to one of the three places that write the CR; it now covers all three.
+  No RBAC change.
+
+### Documentation
+
+- The manual golden-image verify command was **wrong** and would have looked like
+  an invalid signature: it omitted `--insecure-ignore-tlog=true`, which offline
+  signatures require. Corrected, with an explanation of why the flag is not a
+  weakening here.
+
+---
+
+## [v0.13.8] — 2026-08-13
+
+Closes a privilege escalation. Anyone who could create an ordinary Pod in a
+namespace where a guest or sandbox ran could reach **node root** — no SwiftGuest
+required, no CRD access needed. If you run multi-tenant namespaces, this is the
+release to take.
+
+### Upgrade
+
+Drop-in from v0.13.7 — no CRD schema changes, no API changes, no values changes
+required.
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.8 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # helm does not upgrade CRDs
+```
+
+The new admission policy is **on by default** and cluster-scoped. It renders
+only where the cluster serves `admissionregistration.k8s.io/v1
+ValidatingAdmissionPolicy` (Kubernetes **1.30+**); on older clusters it is
+silently skipped and nothing changes. Disable with
+`launcherSAGate.enabled=false` if a policy engine of your own enforces the same
+rule — but read the trust-boundary note in `docs/security-audit.md` first,
+because turning it off restores the escalation.
+
+### Fixed
+
+- **A tenant who can create a Pod can no longer reach node root** (#443, #514).
+
+  Launcher pods run `privileged: true` and are a node-level trust boundary.
+  swiftletd needs `pods: patch` to report status, so the launcher
+  ServiceAccounts carry it — and **Kubernetes has no RBAC gate on which
+  ServiceAccount a pod may name**. So anyone able to create an ordinary Pod
+  could write `serviceAccountName: kubeswift-launcher`, receive that token,
+  patch the privileged launcher's `image`, and get node root. kubelet restarts a
+  container whose spec hash changed regardless of `restartPolicy: Never`.
+
+  v0.13.6's dedicated ServiceAccounts removed *incidental* inheritance and made
+  the grant auditable, but did not close this. Neither would `resourceNames`
+  scoping, which is what the issue originally proposed: RBAC is additive and the
+  ServiceAccount is shared, so an attacker still inherits the union of every
+  launcher pod name in the namespace. Both were tested on a live cluster before
+  being ruled out.
+
+  What closes it is a `ValidatingAdmissionPolicy` supplying the missing gate:
+  only the KubeSwift controller may create a Pod naming a launcher
+  ServiceAccount. A policy rather than a webhook deliberately — the rule matches
+  every Pod CREATE, and a webhook with `failurePolicy: Fail` would make all pod
+  creation in the cluster depend on our webhook server being up. Admission
+  policies are evaluated in-tree.
+
+  Validated on three clusters and two CNIs with the gate live: guest boot, GPU
+  guest, live migration (including the `<guest>-mig-<uid>` destination pod),
+  sandbox, and warm-pool slots (whose names are random) all admitted normally;
+  both launcher ServiceAccounts refused to an ordinary pod. Zero unintended
+  denials across the whole exercise.
+
+- **RC releases were publishing an unsigned image** (#512, #513). `release-rc`
+  still signed from a hand-written list of seven while building eight, so every
+  RC shipped `sandbox-materialize` unsigned — the identical defect #497 fixed in
+  `release-stable`, which had shipped it unsigned for five releases. RC now
+  derives its sign list from the same digest-pinned refs the build emits and
+  verifies its own signatures before publishing. Its pre-release body had
+  drifted the same way, listing six of eight.
+
+### Changed
+
+- **The manifest policy checks render through one script**
+  (`hack/render-lint-profile.sh`). `helm template` has no
+  ValidatingAdmissionPolicy in its default capability set, so a
+  capability-guarded template renders to nothing — CI would have linted the new
+  security control without being able to see it, while reporting green. Both the
+  coverage check and the workflow now share one render, and the coverage check
+  asserts the policy is present.
+
+- `sigstore/cosign-installer` v3 → v4 (#502). The explicit
+  `cosign-release: 'v2.6.5'` pin is retained deliberately: v4 defaults to cosign
+  3.0.5, which rejects `--tlog-upload=false` at runtime — the flag the offline
+  artifact-signing path needs.
+
+### Known issues
+
+- **45 fixable CVEs (1 critical, 23 high) remain in the vendored `cosign`
+  binary** shipped inside `snapshot-oras` and `sandbox-materialize` (#486).
+  They are **not** in KubeSwift code and not in the VM runtime: they are in a
+  signing helper's frozen dependency tree, which nothing in our tooling can
+  bump. v2.6.5 is the newest 2.x, and 3.x needs the offline signing contract
+  redesigned.
+
+  Measured: linking cosign as a Go library instead of vendoring the binary would
+  resolve **30 of the 45, including the only critical**, because Go's minimal
+  version selection would build those packages at the newer versions this
+  repository already carries. The remaining 15 are cosign's own sigstore
+  dependencies. That work is gated on proving signature interop with signatures
+  already in users' registries, so it is tracked rather than rushed.
+
+---
+
+## [v0.13.7] — 2026-08-11
+
+A supply-chain release. Not one line of Go or Rust changed between v0.13.6 and
+v0.13.7 — the diff is workflows, the chart, docs and dependency lockfiles. What
+changed is how much of the release you have to take on trust: every prior
+version asked you to believe that the images in the registry are what this
+repository built, and this one proves it in the same job that publishes them.
+Building that proof immediately turned up an image that had never been signed
+at all.
+
+### Upgrade
+
+**`ui.image.tag` must be `v0.12.3` or newer**, and the chart now ships pinned to
+it rather than tracking `latest`. The UI Deployment sets
+`readOnlyRootFilesystem: true`, which earlier UI images cannot survive: they
+generate their runtime config inside the web root, a directory no volume can make
+writable without hiding the application. An older tag fails closed and loudly:
+
+```
+30-kubeswift-config-js.sh: can't create /usr/share/nginx/html/config.js: Read-only file system
+```
+
+If you override `ui.image.tag`, raise it in the same step as the chart upgrade.
+The tag is still not chart-derived — kubeswift-ui releases on its own cadence, so
+a chart upgrade will not move it for you.
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.7 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml) \
+  --set ui.image.tag=v0.12.3
+kubectl apply -f charts/kubeswift/crds/    # helm does not upgrade CRDs
+```
+
+Otherwise this is a drop-in upgrade from v0.13.6: no CRD schema changes, no API
+changes, and no KubeSwift source changes at all. The binaries are rebuilt, so
+they do carry the dependency updates and toolchain pins below, but no KubeSwift
+logic differs from v0.13.6.
+
+### Fixed
+
+- **`sandbox-materialize` was shipping unsigned, and had been since it entered
+  the release set** (#497). The sign list in `release-stable.yaml` was written by
+  hand and covered eight of the nine published images. Probing the registry
+  directly at v0.12.0, v0.13.0, v0.13.2, v0.13.4 and v0.13.6 finds no signature
+  at any of them, while every other image at those same tags verifies — so
+  anyone running `cosign verify` across the full set has been getting a failure
+  on that one image for five releases, and every release job reported success.
+
+  The sign list is now derived from the same digest-pinned refs the build step
+  emits, so an image cannot be published without also being signed; and the
+  release **verifies its own signatures and attestations before finishing**, so a
+  signing failure now fails the release instead of producing a quietly unsigned
+  artifact. v0.13.7 is the first release in which all nine images are signed.
+
+  Re-verify any deployment that pinned digests on the assumption the whole set
+  was signed. The images themselves were never in question — only the signatures.
+
+- **The image scan queued 117 jobs on a single push** (#489). `paths:` filtering
+  was applied to the `pull_request` trigger but not to `push`, so every merge to
+  `main` re-scanned all nine images regardless of whether anything in them
+  changed. Both triggers now carry the same filter.
+
+### Added
+
+- **The CI security programme (#466) is complete — five phases, four of them
+  gating.** Each answers a different question, and they are deliberately gated
+  differently, because a scanner that cries wolf gets deleted rather than tuned:
+
+  | Phase | Asks | Gate |
+  |---|---|---|
+  | 1 — dependencies + secrets (#467) | is something we depend on known-vulnerable? is a credential committed? | fails the build |
+  | 2 — images (#480) | is something *in the published image* vulnerable? | fails on **fixable** findings only |
+  | 3 — SAST (#487) | did we write a bug? | **report-only** |
+  | 4 — manifests + chart (#494, #495, #496) | would this chart render something we would reject in review? | fails the build |
+  | 5 — signing + attestation (#497) | is what we published what we built? | fails the release |
+
+  Phase 3 is report-only on purpose: gosec reports 86 findings on the current
+  tree, all triaged and recorded as a baseline in the workflow header. Turning
+  that red on day one would mean 86 things to clear before anyone could merge.
+
+  Phase 4's policy baseline lives as per-object
+  `ignore-check.kube-linter.io/<check>` annotations rather than a config-level
+  `exclude:`, so a suppression is visible next to the object it excuses and
+  applies only there. Each was verified by removing it and confirming the check
+  actually fires. It also asserts what it renders: a default `helm template`
+  covers one of five workloads, so a coverage check fails if a new workload is
+  added without being linted.
+
+- **`Verify release` workflow** — re-verify any published tag's signatures and
+  attestations on demand (Actions → Verify release). Deliberately not on a
+  schedule yet; see the header for why, and for what has to be true first.
+
+- **Toolchains are pinned** — Go `1.26.5` (#488) and Rust `1.97.1` (#490),
+  matching the builder images. A floating toolchain changes scanner output
+  without anyone touching the repository, which makes a recorded baseline
+  meaningless.
+
+### Changed
+
+- **The web console runs with a read-only root filesystem** (#507), with
+  `emptyDir` volumes at `/tmp` and `/etc/nginx/conf.d` — the only two paths the
+  image writes. See Upgrade above for the tag floor this requires.
+
+- **The web console has its own empty ServiceAccount**, with
+  `automountServiceAccountToken: false` (#495). It serves static assets; the
+  browser talks to the gateway, not this pod, so it needs no Kubernetes identity
+  at all. Previously it fell back to the namespace `default` ServiceAccount and
+  mounted that token — verified present in the running pod before the fix.
+
+- **`gpu-discovery` asserts `runAsNonRoot` + `RuntimeDefault` seccomp** (#495).
+  The image already ran as uid 65534; the pod spec now states it, so a future
+  base-image change cannot silently regress it.
+
+- **kube and k8s-openapi are grouped for Dependabot** (#498). They are
+  version-locked (kube 0.92 → k8s-openapi ^0.22, kube 4.2 → ^0.28), so ungrouped
+  updates arrived as two PRs that could not build individually *and* did not
+  combine into a working pair. Both were closed; the pair now travels together,
+  including across a major bump.
+
+- **The orphaned `webhook-server` image was removed** (#492). Admission webhooks
+  are served by the controller-manager; nothing referenced it.
+
+- Roughly twenty dependency updates across base images, GitHub Actions, Go and
+  Rust — the routine half of Phase 1 doing its job.
+
+---
+
+## [v0.13.6] — 2026-08-10
+
+A correctness release. Every item is a case where the system did the wrong thing
+quietly — a seed silently discarded, a safety interlock watching the wrong field,
+a controller idling while reporting healthy, an RBAC subject that outlived its
+reason to exist.
+
+### Upgrade
+
+**Upgrade the chart, not just the image tag.** v0.13.6's controller watches
+ServiceAccounts (the launcher-SA work), and that rule ships in this version's
+chart RBAC. A controller image newer than its chart's RBAC cannot sync its
+informer cache — and as of this release it now **exits non-zero** rather than
+running idle, so the mismatch presents as CrashLoopBackOff instead of a cluster
+where nothing reconciles. That is the intended behaviour, but it means an
+image-only bump fails loudly where it used to fail silently.
+
+```bash
+helm upgrade kubeswift oci://ghcr.io/kubeswift-io/charts/kubeswift --version 0.13.6 \
+  -n kubeswift-system -f <(helm get values kubeswift -n kubeswift-system -o yaml)
+kubectl apply -f charts/kubeswift/crds/    # helm does not upgrade CRDs
+```
+
+Also note **`gateway.authMode: insecure` now refuses to render alongside any
+chart-managed exposure** — `gateway.ingress`, `ui.ingress`, or a
+LoadBalancer/NodePort Service for either. If you are running that combination
+today you are serving an unauthenticated control plane; switch to
+`authMode: oidc`, drop the exposure and use port-forward, or set
+`gateway.allowInsecureIngress=true` to accept the risk deliberately.
+
+
+### Fixed
+
+- **A drained namespace now retires the legacy `default` launcher subject**
+  (#443). Subject convergence only ran from a SwiftGuest or SwiftSandbox
+  reconcile, so once the last guest in a namespace was deleted nothing
+  reconciled there again and `default` stayed bound to the reporter ClusterRole
+  forever — the namespace-wide `pods: patch` grant left behind in a namespace
+  with no launcher to justify it, which is when it is least defensible. A small
+  reconciler now watches the launcher RoleBindings themselves, so the object
+  carrying the stale subject drives its own cleanup after every CR is gone.
+
+- **Helper Jobs no longer mount a ServiceAccount token** (#443). Thirteen
+  pod specs across image import/validate, kernel pull, root/data disk
+  provisioning, snapshot s3/oci/cold-migration and clone download now set
+  `automountServiceAccountToken: false`. None of them talks to the API server.
+  Launcher pods are deliberately untouched — swiftletd needs its token to
+  report status.
+
+- **A NoCloud seed with no `metaData` no longer discards the operator's
+  cloud-config** (#457). NoCloud is only recognised as a datasource when the
+  seed disk carries a `meta-data` file; the renderer omitted the key when the
+  field was empty, so cloud-init fell back to `DataSourceNone` and threw away
+  `userData` entirely — no user, no SSH key, no hostname — while the guest
+  booted, took a DHCP lease and reported Running/Ready. Nothing in `kubectl`
+  indicated anything had gone wrong.
+
+  The controller now synthesizes `instance-id: <namespace>-<guest>` +
+  `local-hostname: <guest>` when neither `metaData` nor `metaDataFrom` is set.
+  `instance-id` must be stable per guest because cloud-init keys "have I already
+  run for this instance?" off it. This is what the clone path already did, which
+  is why clones worked and ordinary guests did not. An explicit value always
+  wins; only NoCloud is affected.
+
+- **The chart's insecure-ingress interlock now triggers on actual reachability**
+  (#459). It only checked `gateway.ingress.enabled`, while the documented way to
+  publish the UI is `ui.ingress` — and the UI's nginx proxies the Connect RPCs to
+  the gateway at same origin, so it exposes the identical control plane. A hub
+  went out unauthenticated on a public address with the guard silent and
+  `allowInsecureIngress` still `false`. The check now covers `gateway.ingress`,
+  `ui.ingress`, and a `LoadBalancer`/`NodePort` Service for either — the last of
+  which needs no Ingress object at all. `authMode: insecure` remains usable with
+  no exposure (port-forward), and the override is unchanged.
+
+- **A cache that never syncs is now fatal instead of silent** (#460). When RBAC
+  denies a watched type, the reflector retries forever: the manager stays up, the
+  pod stays Ready, and *nothing* reconciles — no controller starts until every
+  informer syncs — so fresh resources sat with a completely empty `.status`, no
+  pod and no event. The manager now waits a bounded 3 minutes and exits non-zero
+  with the likely cause, turning an idle-but-healthy process into a
+  CrashLoopBackOff next to the reflector's own `is forbidden` lines. A cancelled
+  context (SIGTERM, lost leader election) is still a clean shutdown.
+
+  Note this differs from a *missing CRD*, which already failed at informer
+  construction — only the RBAC-denied case was invisible.
+
+### Added
+
+- **Launcher pods run as dedicated ServiceAccounts** (#456). Until now they used
+  the workload namespace's `default`, and the reporter ClusterRole was bound to
+  it — so every Job, sidecar, CronJob and debug pod in that namespace silently
+  inherited `pods: patch` on a **privileged** launcher. Guests and sandboxes now
+  get separate SAs (`kubeswift-launcher`, `kubeswift-sandbox-launcher`), and a
+  sandbox launcher no longer receives `swiftguests/status` at all — it never
+  needed it, and granting it would let an escaped sandbox forge conditions on any
+  guest in the namespace.
+
+  The binding *converges* rather than being created once: the new SA is always
+  bound, and `default` stays bound only while a launcher pod is still running as
+  it, so an in-place upgrade does not break VMs that keep their original SA until
+  they next stop or migrate.
+
+  **If you attach `imagePullSecrets` to the namespace `default` ServiceAccount**
+  for a private registry, launchers no longer inherit them. Set
+  `swiftletd.imagePullSecrets` so the chart puts them on the pod, where they
+  apply regardless of SA — otherwise the first guest after upgrade is
+  `ImagePullBackOff`.
+
+  Read the scope honestly: Kubernetes has no RBAC gate on which ServiceAccount a
+  pod may reference, so this removes *incidental* inheritance and makes the grant
+  auditable — it does not stop someone who can create pods from naming the SA.
+  See `docs/security-audit.md` and #443.
+
+- **`swiftctl image publish` survives a registry rate limit** (#455). A 429 —
+  or a 403 whose body says rate limit, which is how GitHub signals its secondary
+  limit — aborted the whole publish and threw away every chunk already uploaded.
+  It now retries with jittered exponential backoff and scales chunk size with
+  artifact size. A plain 403 is still permission-denied and still fails fast;
+  retrying it would just be a slow way to reach the same error.
+
+- **Operator guide for apiserver audit logging** (#454) —
+  `docs/operator/audit-logging.md`, including why a VM platform needs it and the
+  k0s file-permission trap that makes the apiserver refuse to start.
+
+- **`spec.schedulerName` on SwiftGuest**, and therefore on every SwiftGuestPool
+  replica (the pool copies its template spec wholesale). It sets
+  `pod.spec.schedulerName` on the launcher, which lets a guest opt into a
+  kube-scheduler profile configured with the `NodeResourcesFit`
+  `LeastAllocated` scoring strategy.
+
+  This closes the gap in #418. `spreadPolicy: Spread` counts pods, so it will
+  place the next replica on a node that is already nearly full as long as that
+  node holds no more pods of the pool than its neighbours. The launcher has
+  always requested the guest's real footprint — cpu equal to the vCPU count,
+  memory equal to guest RAM plus overhead, requests equal to limits — so the
+  scheduler could already score on utilization; what an operator had no way to
+  express was how heavily free capacity should weigh. Naming a profile is that
+  expression. The two compose: spread keeps replicas off one node,
+  `LeastAllocated` breaks the tie toward the emptiest.
+
+  `nodeName` still wins — direct binding skips the scheduler entirely, so the
+  field is left unset on the pod rather than written as configuration that
+  never ran. An unknown profile name leaves the pod Pending indefinitely and
+  KubeSwift cannot warn about it, because the set of scheduler profiles is not
+  exposed through the API; the guide says so plainly.
+
+---
+
+## [v0.13.5] — 2026-08-09
+
+An incident release. Two SwiftGuests were deleted from a lab cluster and the
+cause could not be established — not because the evidence was ambiguous, but
+because none existed. The gateway had served traffic for 42 hours and written
+three lines, all from start-up.
+
+### Added
+
+- **The gateway records every RPC.** Mutations are logged unconditionally with
+  the service, method, impersonated user, cluster, namespace, object name and
+  outcome; reads sit at `-v=1` because list/watch/telemetry poll continuously.
+
+  Classification is *default-mutating*: a procedure counts as a read only if its
+  name begins with a known read verb, so an RPC added later that nobody
+  classifies is logged loudly rather than skipped silently.
+
+  This matters more than it looks for this object. A SwiftGuest carries no
+  finalizer and no owner reference, so a delete takes the object, its launcher
+  pod and its events together and leaves nothing behind to inspect. The gateway
+  is the only place such a call can be observed at all.
+
+  **This records calls that go through the gateway.** A `kubectl delete` still
+  leaves no KubeSwift-side trace — for that, enable apiserver audit logging.
+
+### Fixed
+
+- **The fleet view reported an unreachable cluster as an empty one**
+  (kubeswift-ui #42). `ListGuests` is partial-fleet: a member that fails yields
+  an `errors` entry while the RPC still returns OK. The UI cleared its table and
+  repopulated from an empty list, then set the state to "live" — so a failed
+  query rendered as a confident **"No VMs across the fleet."**, and self-healed
+  on the next 3-second poll, making it near-impossible to catch in the act.
+
+  A cluster that errors now keeps its last-known rows flagged stale, "live"
+  means the whole fleet answered (a partial answer is "degraded"), and the
+  "No VMs" message is only shown when every member actually replied.
+
+- Deleting a VM from the UI now requires typing its name. The previous yes/no
+  confirm was not an adequate gate for an irreversible action that leaves
+  nothing behind, and afterwards is indistinguishable from a delete nobody
+  performed.
+
+### Upgrade notes
+
+No API, CRD or chart-value changes. **kubeswift-ui v0.12.2** carries the fleet
+fix; the gateway change is independent and needs no UI update.
+
+---
+
+## [v0.13.4] — 2026-07-28
+
+Second security pass. A UI-focused review found a class of defect in the v0.11.0
+guided forms, and closing out every remaining finding from both reviews produced
+six more fixes across the gateway, controller, chart and launcher. Validated on
+the dev cluster — including the two items previous releases could only unit-test.
+
+### Action required on upgrade
+
+- **The rendered cloud-init seed is now a Secret, not a ConfigMap.** Anything
+  reading `<guest>-seed` as a ConfigMap must read the Secret instead. A guest
+  that is already running keeps its ConfigMap until it is next recreated (the
+  controller will not delete it out from under a live pod); guests created after
+  the upgrade never get one.
+- **The console and sandbox WebSocket planes now expect the bearer as a
+  `Sec-WebSocket-Protocol` subprotocol.** `?token=` still works and is logged as
+  deprecated, so an older UI keeps functioning — but **kubeswift-ui must be at
+  v0.12.0 or later** to use the new form. Upgrade both.
+- **`auth-mode=insecure` now refuses cross-origin WebSocket upgrades** even with
+  `gateway.corsAllowOrigin="*"`. Set an explicit origin, or use a real auth mode.
+  No change for `oidc`/`token` deployments.
+- **SwiftKernel is now validated at admission.** An `ociRef.image` containing
+  shell metacharacters or `..`, or a `kernelCmdline` with a newline, is rejected.
+- `make deploy` (kustomize) now installs 9 webhooks instead of 7 — SwiftSnapshot
+  and SwiftRestore were silently missing.
+
+### Fixed
+
+- **Guided forms silently rewrote fields the operator never touched**
+  (kubeswift-ui #37). `hydrate()` failed to recognise a variant and `build()`
+  overwrote the subtree. The PodSpec editor rebuilt from scratch, dropping
+  `automountServiceAccountToken`, `initContainers`, `envFrom`, `capabilities`,
+  `seccompProfile`, `affinity`, probe tuning, extended resources like
+  `nvidia.com/gpu`, env `valueFrom` and volumeMount `subPath`;
+  `allowPrivilegeEscalation: false` was not even expressible; unmodelled volume
+  types became `emptyDir` while keeping the name, so mounts still resolved onto
+  an empty tmpdir. A SwiftSnapshotSchedule on the s3 or oci backend was rewritten
+  to `local`, silently redirecting offsite backups to node disk; a SwiftImage on
+  the oci source lost its cosign `verifyKeySecretRef`.
+- **The WebSocket bearer travelled in the query string** (#445) and so was
+  written to every access log on the path — the UI's nginx and any ingress in
+  front of it — leaving replayable ID tokens readable by anyone with `pods/log`.
+- **`CheckOrigin` accepted every origin** (#445). Harmless under a real auth mode,
+  but under `auth-mode=insecure` any page the operator visited could open a
+  console or a sandbox shell.
+- **Cloud-init user-data sourced from a Secret was re-materialized into a
+  plaintext ConfigMap** (#446) — SSH keys, passwords and join tokens readable
+  with `get configmaps`.
+- **controller-manager ran with no `securityContext`** (#447), alone among the
+  components this project ships.
+- **Release workflows ran Actions on floating tags** while holding
+  `id-token: write` for cosign keyless signing (#447).
+- **SwiftKernel had no validating webhook at all** (#448), and the snapshot
+  host-path guard existed only in the webhook — which is disabled by default.
+- **A SwiftGuest pinned to an unschedulable node stalled silently** (#449,
+  closes #444). The taint check ran after the root-disk clone Job had already
+  pinned to the same node, so reconcile never reached it.
+- **Sandbox `restricted` egress was bypassable by source-address spoofing**
+  (#449). The policy chain was entered on `-s <subnet>`; the guest configures its
+  own NIC, so a forged source did not match the jump and skipped every DROP.
+  IPv6 had no rules at all.
+
+### Changed
+
+- `migration.mtls` stays **off** by default; its documentation now states plainly
+  that a cross-node live migration streams guest RAM in the clear when it is off,
+  and that enabling it is a hard cert-manager dependency.
+
+---
+
+## [v0.13.3] — 2026-07-26
+
+Security release. A five-domain review (gateway auth, RBAC/chart/containers, UI,
+VM runtime, supply chain) produced eight fixes. Every one carries a regression
+test that was verified to fail without its source change.
+
+### Action required on upgrade
+
+- **`gateway.authMode` now defaults to `oidc`** (was `insecure`, which performs no
+  authentication at all). The gateway is not deployed unless `gateway.enabled=true`
+  or `federation.role=hub`, so a bare install is unaffected — but if you enable the
+  gateway you must now configure an IdP, or set `gateway.authMode=insecure`
+  deliberately. The chart also refuses `authMode=insecure` together with
+  `gateway.ingress.enabled`; override with `gateway.allowInsecureIngress=true`.
+- **SwiftGuest host paths are confined to an allowlist that is empty by default.**
+  `spec.filesystems[].source.hostPath` and vhost-user socket directories are
+  rejected until an operator opts in with `swiftGuest.allowedHostPathPrefixes`.
+  `pvcRef` shares are unaffected. See `docs/virtiofs.md`.
+- **`spec.interfaces[].mac` must be a canonical MAC.** Previously unvalidated.
+- **The `manage-rbac` capability no longer grants `escalate`/`bind`**, so the UI's
+  Admin role can no longer grant permissions its holder does not already have.
+
+### Fixed
+
+- **Gateway `ListClusters`/`WatchClusters` were unauthenticated** — both returned
+  every member cluster's apiserver URL, version and condition messages to any
+  caller that could reach the port, and `WatchClusters` streamed it live. (#434)
+- **Secret redaction was bypassed by the kubectl annotation.** Only `data` and
+  `stringData` were stripped, so a Secret created with `kubectl apply` still
+  carried its plaintext `stringData` in
+  `kubectl.kubernetes.io/last-applied-configuration`. (#434)
+- **OIDC claims could assert `system:masters`.** Claim values were copied verbatim
+  into the impersonation headers with no reserved-prefix guard. (#434)
+- **Command injection in the image-import and kernel-pull Jobs.** `fmt.Sprintf("%q")`
+  is a Go quoter, not a shell quoter — it leaves `$` and backticks intact — and the
+  result was placed inside shell double quotes. A SwiftImage URL or SwiftKernel OCI
+  reference containing `$(...)` executed as root in a privileged container. Values
+  now ride as environment variables. (#435)
+- **The Cloud Hypervisor binary was downloaded without integrity verification**,
+  while the firmware beside it was already checksum-pinned. Both architectures are
+  now pinned. (#436)
+- **Verify-before-boot had a TOCTOU in `sandbox-materialize`** — it verified one
+  digest and then re-resolved the tag, so a tag swap between the two defeated
+  `verifyKeySecretRef`. It now materializes the digest it verified. (#436)
+- **Unconfined SwiftGuest host paths.** `hostPath: /` mounted the node root
+  read-write into a tenant's VM. (#437)
+- **`spec.interfaces[].mac` reached a sourced shell file**, so a MAC containing a
+  command substitution executed in the privileged launcher. (#439)
+- **`spec.nodeName` bypassed the scheduler's taint check.** Direct pod binding is
+  deliberate (live migration depends on it), so the taint predicate is now
+  reproduced in the controller instead of changing the binding. (#439)
+- oras-go bumped for GO-2026-5880; both CI workflows declare least-privilege
+  `permissions`. (#436)
+
+### Changed
+
+- The host-path allowlist is enforced in the controller as well as the validating
+  webhook, so it holds on installs running with `webhook.enabled=false`. (#441)
+- `docs/security-audit.md` SEC-01/02/03 move from RESOLVED to **ACCEPTED**: the
+  capability-scoped launcher was implemented and then reverted because it broke
+  QEMU boot, so every launcher is privileged by design. README and the GPU and
+  operator docs said otherwise and are corrected. The consequence is recorded
+  plainly — the launcher pod is a node-level trust boundary. (#438)
+
+### Known
+
+- The launcher pod runs as the namespace `default` ServiceAccount, which is bound
+  `pods: get,patch`. Anyone able to create a pod in that namespace inherits it and
+  can patch the privileged launcher's image. A dedicated ServiceAccount is planned
+  but does not by itself close this — Kubernetes does not gate which ServiceAccount
+  a pod may reference. Tracked.
+
+---
+
 ## [v0.13.2] — 2026-07-24
 
 Gateway enablement for permission-aware, general-purpose Kubernetes resource CRUD
@@ -668,7 +1742,7 @@ secondary-UDN) path.
   Detected from the `k8s.ovn.org/primary-user-defined-network` namespace label — no
   SwiftGuest spec change. The launcher datapath (`setup_primary_udn_nic`) bridge-binds
   the pod's `ovn-udn1` interface to the VM's tap so the VM adopts OVN's IP-derived MAC +
-  IP (the KubeVirt bridge-binding pattern; OVN `port_security` pins them). Because the
+  IP (the standard bridge-binding pattern; OVN `port_security` pins them). Because the
   primary UDN is bridged to the guest and the pod's `eth0` is infrastructure-locked,
   swiftletd cannot reach the apiserver — so the **controller derives status**:
   `status.network.primaryIP` from the pod's `k8s.ovn.org/pod-networks` annotation,
@@ -778,7 +1852,8 @@ zero-touch, no manual `ovn-nbctl`. Cluster-validated end-to-end on image
     guest's bridged MAC, not the pod NIC's) and, once known,
     `<provider>.kubernetes.io/ip_address: <guest IP>` (a stable static IP across
     pod recreate). The live-migration **destination** pod additionally gets
-    `kubevirt.io/migrationJobName`, which makes kube-ovn's IPAM skip the conflict
+    the migration-job annotation kube-ovn's IPAM recognises
+    (`swiftguest.MigrationJobNameAnnotation`), which makes it skip the conflict
     check so the dst acquires the **same** static IP the source still holds through
     cutover. Reads NADs read-only (new
     `k8s.cni.cncf.io/network-attachment-definitions` get RBAC). No-op for every
@@ -789,7 +1864,7 @@ zero-touch, no manual `ovn-nbctl`. Cluster-validated end-to-end on image
     makes the kernel add a permanent fdb entry `<guest-mac> -> NIC` that **shadows
     the tap** (the bridge sends the guest's return traffic to the NIC, not the
     guest). `network-init` now re-MACs the NIC to a dummy **before** enslaving it
-    (the KubeVirt bridge-binding pattern); the OVN port keeps the guest MAC, so OVN
+    (the standard bridge-binding pattern); the OVN port keeps the guest MAC, so OVN
     still delivers the guest's frames `NIC -> br0 -> tap`. A no-op for any NAD whose
     IPAM gives the NIC its own distinct MAC.
   - **Validation.** Cluster-validated **zero-touch end-to-end** on image

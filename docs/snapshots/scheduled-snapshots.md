@@ -39,15 +39,23 @@ credentials) — see [`config/samples/snapshot-schedule/02-schedule-s3-ttl.yaml`
 
 ## Semantics
 
-- **Cron** is standard 5-field, evaluated in **UTC**. After a controller outage
-  the schedule fires **at most one** catch-up snapshot (the most recent missed
-  tick), never a backlog.
+- **Cron** is standard 5-field, evaluated in **UTC** regardless of the timezone
+  the controller pod runs in. To schedule in another zone, prefix the expression
+  with `CRON_TZ=`: `CRON_TZ=Europe/Rome 0 2 * * *` fires at 02:00 Rome time,
+  shifting against UTC across DST. After a controller outage the schedule fires
+  **at most one** catch-up snapshot (the most recent missed tick), never a
+  backlog.
 - **`concurrencyPolicy: Forbid`** (default) skips a tick while a prior scheduled
   snapshot is still capturing/uploading — captures are heavy; this prevents them
   stacking. `Allow` lets them overlap.
 - **`startingDeadlineSeconds`** skips a tick missed by more than this (e.g. after
   an outage) instead of firing it late.
 - **`suspend: true`** pauses firing without deleting the schedule or its snapshots.
+- **A date that never occurs is refused**, rather than accepted and never fired:
+  30 or 31 February, and the 31st of April, June, September or November. Cron
+  considers these well-formed — 31 is a legal day and April a legal month — and
+  only fails to match them once running. 29 February is not one of them; it
+  fires in leap years.
 
 ## Retention — keep-N vs ttl
 
@@ -79,6 +87,28 @@ keep-N safety:
 - **local**: ⚠️ writes a **fixed `hostPath`**, so scheduled local snapshots
   overwrite each other — **don't schedule the local backend**; use csi or s3.
 
+## Status
+
+`kubectl get sss` shows a `Ready` column, taken from the schedule's `Ready`
+condition:
+
+| Ready | Reason | Meaning |
+|---|---|---|
+| `True` | `Scheduled` | `spec.schedule` parses; a snapshot is created on each tick. |
+| `False` | `InvalidSchedule` | `spec.schedule` is unusable — it does not parse, or it names a date that never occurs. The schedule will never fire; `message` carries the reason. |
+| `False` | `Suspended` | `spec.suspend` is set. |
+
+`InvalidSchedule` is the one to watch for. The admission webhook that rejects a
+bad cron expression is off by default (`webhook.enabled=false`), so a malformed
+`spec.schedule` reaches the controller instead. Before this condition existed
+the only trace was a controller log line: the schedule read as healthy under
+`kubectl get` and silently never fired.
+
+```bash
+kubectl get sss nightly-db \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'
+```
+
 ## Observability
 
 `kubeswift_snapshot_schedule_pruned_total` counts keep-N deletions. Scheduled
@@ -92,4 +122,6 @@ latency/size metrics (see [`observability.md`](observability.md)).
   Kubernetes' 63-character limit.
 - The cron expression and the `template.spec` are validated at schedule-create
   by the admission webhook (a bad template is rejected up front, not at the
-  first tick).
+  first tick) — **when the webhook is enabled**. `webhook.enabled` is false by
+  default; with it off, a bad cron expression is caught by the controller and
+  reported as `Ready=False` / `InvalidSchedule` instead (see [Status](#status)).

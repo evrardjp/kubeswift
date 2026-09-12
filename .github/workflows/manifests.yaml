@@ -1,0 +1,195 @@
+name: Manifests
+
+# Phase 4 of #466, steps 1-2 (see the design in #493).
+#
+# Phase 1 asks whether a dependency is vulnerable. Phase 2 asks the same of an
+# image. Phase 3 asks whether we wrote a bug. This asks whether what we DEPLOY
+# is valid — schema-correct, and actually being looked at.
+#
+# GATING: this fails the build, unlike Phase 3. It belongs in the Phase 1
+# category rather than the SAST one: an invalid manifest or a shrunk render is
+# unambiguous and always actionable, so a red build here always means something
+# real. Verified passing on the tree before landing, so it lands clean.
+#
+# NO SCHEDULE, deliberately. Image scanning runs nightly because CVEs are
+# disclosed against images we already shipped without anything here changing.
+# Manifest validity has no such external clock — it only changes when we change
+# the chart. A nightly run would burn minutes to re-confirm the same answer.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'charts/**'
+      - 'config/crd/**'
+      - 'hack/lint-values/**'
+      - 'hack/verify-render-coverage.sh'
+      - 'hack/verify-image-tags.sh'
+      - 'hack/verify-doc-versions.sh'
+      - 'hack/verify-values-schema.sh'
+      - 'README.md'
+      - 'docs/**'
+      - '.github/workflows/manifests.yaml'
+  push:
+    branches: [main]
+    # The SAME list as the PR trigger, written out rather than shared via a YAML
+    # anchor: GitHub Actions' workflow parser does not reliably support anchors,
+    # and a workflow that fails to parse is worse than a duplicated list. If you
+    # edit one list, edit the other.
+    #
+    # Both triggers are filtered on purpose. #480 filtered pull_request only and
+    # left push open, so every merge to main rebuilt and rescanned all nine
+    # images — 13 dependency merges queued 117 jobs and starved the runners
+    # (fixed in #489). Not repeating that here.
+    paths:
+      - 'charts/**'
+      - 'config/crd/**'
+      - 'hack/lint-values/**'
+      - 'hack/verify-render-coverage.sh'
+      - 'hack/verify-image-tags.sh'
+      - 'hack/verify-doc-versions.sh'
+      - 'hack/verify-values-schema.sh'
+      - 'README.md'
+      - 'docs/**'
+      - '.github/workflows/manifests.yaml'
+
+jobs:
+  manifests:
+    name: Render + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: helm version
+        # Preinstalled on the runner image. Printed so a version change shows up
+        # in the log if rendering ever starts behaving differently.
+        run: helm version --short
+
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: '0.8.0'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+          /tmp/kubeconform -v
+
+      # STEP 2 of the design, and it runs FIRST on purpose. Validating a render
+      # that is missing four of five workloads would pass and mean nothing, so
+      # coverage is established before anything is judged.
+      - name: Verify render coverage
+        run: ./hack/verify-render-coverage.sh
+
+      # Helm ignores a values key no template reads, so a typo is a setting
+      # that never takes effect. `snapshotOras` (the real key is snapshotORAS)
+      # rode along in real values for four releases that way, with the snapshot
+      # image frozen underneath it. values.schema.json makes such a key an
+      # install/upgrade error.
+      #
+      # Every render in this job would still pass with that schema deleted or
+      # loosened, so none of them shows it works. This asserts misspelt keys
+      # FAIL at three depths, free-form maps and `global` still pass, and the
+      # schema has not drifted from values.yaml.
+      - name: Verify values schema
+        run: ./hack/verify-values-schema.sh
+
+      # Rendered through the shared script, NOT an inline `helm template` line.
+      # verify-render-coverage above uses the same script, so the set of objects
+      # asserted-present and the set actually scanned cannot drift apart. They
+      # previously could: capability-guarded templates (the #443 admission gate)
+      # render to nothing unless --api-versions is passed, so an inline command
+      # here that lacked the flag would scan a security control it could not see
+      # while every check stayed green.
+      - name: Render the full lint profile
+        run: |
+          set -euo pipefail
+          ./hack/render-lint-profile.sh > /tmp/rendered.yaml
+          test -s /tmp/rendered.yaml
+
+      # Tag plausibility, which no other check in this job covers: kubeconform
+      # validates schema and kube-linter validates policy, and a nonexistent
+      # image tag is valid under both. It only fails later, on a node, at pull
+      # time. `vv0.13.11` shipped on the install-from-a-checkout path for
+      # several releases exactly this way.
+      - name: Verify image tags
+        run: ./hack/verify-image-tags.sh
+
+      # The docs equivalent of the tag check above. README.md and eight pages
+      # sat on `--version 0.13.10` across three releases, so anyone following
+      # the quickstart installed a chart three versions old and got a CRD
+      # without the fields the page described. Bumping them is a manual release
+      # step nobody owned; now it fails the build instead.
+      - name: Verify docs pin the current chart version
+        run: ./hack/verify-doc-versions.sh
+
+      # STEP 1. -strict is the flag that matters: it rejects unknown and
+      # duplicate fields, which is exactly the class that bites this project —
+      # the API server silently DROPS unknown fields, so a typo'd key becomes a
+      # setting that never takes effect, with nothing to notice.
+      #
+      # -ignore-missing-schemas skips kinds whose CRDs belong to other projects:
+      # cert-manager (Certificate, Issuer, ClusterIssuer) and prometheus-operator
+      # (ServiceMonitor, PrometheusRule). We do not own those schemas and will
+      # not vendor a third-party schema catalogue into a job like this. The
+      # summary line prints the skipped count, so the number is visible rather
+      # than assumed — 7 of 44 objects at the time of writing.
+      #
+      # Our OWN CRDs are not validated here: kubeconform has no schema for
+      # CustomResourceDefinition at any --kubernetes-version, so it errors on
+      # all 15 rather than checking them. They are generated by controller-gen
+      # and their real failure mode — a base that never reaches the cluster —
+      # is covered by `make verify-crd-sync`.
+      - name: kubeconform (strict)
+        run: |
+          /tmp/kubeconform \
+            -strict \
+            -summary \
+            -kubernetes-version 1.34.0 \
+            -ignore-missing-schemas \
+            /tmp/rendered.yaml
+
+      - name: Install kube-linter
+        env:
+          KUBE_LINTER_VERSION: '0.8.3'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/kube-linter.tar.gz \
+            "https://github.com/stackrox/kube-linter/releases/download/v${KUBE_LINTER_VERSION}/kube-linter-linux.tar.gz"
+          tar -xzf /tmp/kube-linter.tar.gz -C /tmp kube-linter
+          /tmp/kube-linter version
+
+      # STEPS 4-5 of #493, landed together rather than report-only-then-gate.
+      #
+      # The report-only cycle in that plan was a proxy for "we do not know the
+      # finding volume". We do now: the default check set finds FIVE issues on
+      # the full render, every one of them understood, and the baseline below
+      # accounts for all five. There is no unknown noise to discover, so an
+      # intermediate cycle would only delay the gate. Contrast Phase 3 (#487),
+      # which stayed report-only because gosec found 86.
+      #
+      # THE BASELINE LIVES ON THE OBJECTS, NOT HERE. Each excused finding is an
+      # `ignore-check.kube-linter.io/<check>` annotation on the specific workload,
+      # carrying the reason:
+      #
+      #   dra-driver     run-as-non-root        root by design (kubelet plugin
+      #                                         sockets, /var/run/cdi)
+      #   dra-driver     sensitive-host-mounts  /sys for GPU/PCI topology
+      #   gpu-discovery  sensitive-host-mounts  /sys, read-only, uid 65534
+      #   kubeswift-ui   latest-tag             UI released from its own repo
+      #   kubeswift-ui   no-read-only-root-fs   TEMPORARY, kubeswift-ui#43
+      #
+      # That is the whole point of the design: a config-level `exclude:` would
+      # switch a check off everywhere, so a NEW privileged container or host
+      # mount would sail through. Verified it does not — with the baseline in
+      # place the chart reports 0 findings, but injecting privileged + root +
+      # hostPath:/etc into controller-manager produces 4 findings and exit 1,
+      # including the two checks the DaemonSets are excused from.
+      #
+      # gpu-discovery is excused ONLY for the host mount; it keeps run-as-non-root
+      # because it genuinely runs as uid 65534. dra-driver looks identical to a
+      # linter but must keep its exemption — see #495.
+      - name: kube-linter
+        run: /tmp/kube-linter lint /tmp/rendered.yaml

@@ -38,6 +38,13 @@ swiftletd:
     limits:
       cpu: 2
       memory: 2Gi
+  # Secrets attached to every LAUNCHER pod for pulling the swiftletd image.
+  # From v0.13.6 launcher pods run as a dedicated ServiceAccount
+  # (kubeswift-launcher / kubeswift-sandbox-launcher) instead of the namespace
+  # `default` SA, so they no longer inherit pull secrets patched onto `default`.
+  # Set this if the launcher image lives on a private registry; leaving it empty
+  # is correct for a public registry.
+  imagePullSecrets: []
 
 # snapshot-s3: the uploader/downloader image for the Tier C (s3 / object-storage)
 # snapshot backend. The controller passes this to the per-snapshot upload Job and
@@ -178,7 +185,21 @@ gateway:
   #   insecure - member queries run as the gateway's own credential, with NO
   #              per-user impersonation. DEV/LAB ONLY: every UI user inherits
   #              whatever the member credentials grant. Do not use in production.
-  authMode: insecure
+  # SECURE BY DEFAULT: oidc. authMode=insecure performs NO authentication at all
+  # -- every caller runs as the member cluster credential across the whole API
+  # plus the console and sandbox-exec planes -- so it is opt-in, never inherited.
+  # The gateway is not deployed unless gateway.enabled=true (or role=hub), so
+  # this only asks operators who are deliberately standing up the browser-facing
+  # control plane to pick an auth mode.
+  #   oidc      verify the IdP token, impersonate the user (see docs/ui/auth.md)
+  #   token     Kubernetes TokenReview
+  #   insecure  DEV/LAB ONLY -- no authentication
+  authMode: oidc
+  # Escape hatch for authMode=insecure + ingress.enabled, which the chart
+  # otherwise refuses: that combination puts an UNAUTHENTICATED control plane
+  # (VM console, sandbox exec, RBAC editor) on the network. Only set this if the
+  # gateway is isolated by other means.
+  allowInsecureIngress: false
   # OIDC settings (used only when authMode=oidc). The gateway verifies the
   # browser-supplied ID token against issuerURL's JWKS and impersonates the
   # claim-derived user+groups onto each member. issuerURL must resolve to ONE URL
@@ -252,9 +273,18 @@ ui:
     # Full image repository (kubeswift-ui is a top-level package, not under the
     # ghcr.io/kubeswift-io/kubeswift/ prefix the operator images use).
     repository: ghcr.io/kubeswift-io/kubeswift-ui
-    # Pin a published tag (sha-<short> or vX.Y.Z). "latest" tracks the
-    # kubeswift-ui main branch; fine for dev, pin a version for production.
-    tag: latest
+    # A published kubeswift-ui tag (vX.Y.Z, or sha-<short> for a dev build).
+    #
+    # Pinned, not "latest". The Deployment sets readOnlyRootFilesystem: true,
+    # and v0.12.3 is the FLOOR for that — earlier images write their runtime
+    # config into the web root, which no volume can make writable without
+    # hiding the SPA, so nginx never starts (kubeswift-io/kubeswift-ui#43).
+    # A floating tag would let that regress silently on a redeploy.
+    #
+    # kubeswift-ui releases on its own cadence from its own repo, so this is
+    # NOT chart-derived and a chart bump does not move it: check the UI repo's
+    # releases and raise this when you want a newer console.
+    tag: v0.12.4
     pullPolicy: IfNotPresent
   # New ghcr packages default PRIVATE; until the kubeswift-ui package is made
   # public (one-time, web UI), reference a docker-registry pull Secret here,
@@ -316,6 +346,59 @@ ui:
 webhook:
   enabled: false
 
+# scopedLauncherRBAC — per-launcher-pod RBAC (#515), defence in depth.
+#
+# The controller ALWAYS creates a per-pod Role+RoleBinding granting a launcher
+# get/patch on exactly its own pod. That alone narrows nothing: RBAC is a union,
+# so while the shared namespace-wide binding also exists the launcher keeps
+# namespace-wide access.
+#
+# Enabling this RETIRES that shared binding, leaving the per-pod grants as the
+# only access. It is off by default because turning it on DELETES a live grant.
+#
+# This is NOT what closes the #443 escalation — that is launcherSAGate below.
+# RBAC is additive on a shared ServiceAccount, so scoping alone cannot stop an
+# attacker who obtains the SA. This limits what the token is worth if they get
+# it another way.
+#
+# Covers every launcher: guests, migration targets, sandboxes, and warm pool
+# slots. A pool converges grants for the slots it already has, so enabling this
+# on a running pool does not cut off live slots.
+#
+# Cost is two objects (a Role and a RoleBinding) per launcher pod, created and
+# garbage-collected with it.
+scopedLauncherRBAC:
+  enabled: false
+
+# Launcher-ServiceAccount admission gate (#443). ON by default — it closes a
+# privilege escalation, and a security control that ships off is a security
+# control nobody has.
+#
+# Launcher pods run privileged and are a NODE-level trust boundary. swiftletd
+# needs `pods: patch` to report status, so the launcher ServiceAccounts carry
+# it — and Kubernetes has no RBAC gate on *which* ServiceAccount a pod may
+# name. Without this, anyone who can create a Pod in a namespace where a guest
+# runs can name the launcher SA, get its token, patch the privileged launcher's
+# image, and reach node root. Scoping the RBAC with resourceNames does NOT close
+# that (RBAC is additive and the SA is shared) — this gate does.
+#
+# Implemented as a ValidatingAdmissionPolicy, evaluated in-tree by the
+# apiserver, so unlike a webhook there is no server whose outage would block
+# pod creation cluster-wide. Rendered only when the cluster serves
+# admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (GA in k8s 1.30+);
+# on older clusters it is silently skipped and the namespace is a trust
+# boundary instead — see docs/security-audit.md.
+#
+# Turn OFF only if you operate the workload namespaces as a trust boundary
+# already, or a policy engine of your own enforces the same rule.
+launcherSAGate:
+  enabled: true
+  # Must match the constants the controller stamps on launcher pods
+  # (internal/controller/swiftguest/rbac.go). Change both together or the gate
+  # protects a ServiceAccount nothing uses while the real one stays open.
+  guestServiceAccountName: kubeswift-launcher
+  sandboxServiceAccountName: kubeswift-sandbox-launcher
+
 # Observability (optional). Requires the Prometheus Operator CRDs
 # (monitoring.coreos.com — e.g. kube-prometheus-stack) when enabled; the
 # dashboards additionally need a Grafana with the dashboard sidecar (the
@@ -351,11 +434,52 @@ monitoring:
 # Live migration settings.
 migration:
   # mTLS transport for cross-node live migration (Phase 3c, Option B per-node
-  # identity). When enabled the chart provisions a per-namespace cert-manager
-  # PKI (selfSigned Issuer -> CA -> CA Issuer) in .Values.namespace and the
-  # controller-manager runs with --migration-mtls-enabled=true (issues one
-  # leaf Certificate per worker node). Requires cert-manager installed
-  # cluster-side. Off by default — default clusters incur no cert-manager
-  # dependency and no behavior change.
+  # identity).
+  #
+  # WHAT IS ON THE WIRE WITH THIS OFF (the default): a cross-node live
+  # migration streams the guest's RAM between launcher pods in the CLEAR, over
+  # the pod network. That memory contains whatever the guest holds at that
+  # moment — SSH host keys, in-memory secrets, disk-encryption keys, database
+  # buffers. Anyone able to observe pod-to-pod traffic on the migration path
+  # (a compromised node, a CNI with no encryption, a span port) can read it.
+  # Offline migration does not stream memory and is unaffected.
+  #
+  # ENABLING IT IS A HARD DEPENDENCY ON cert-manager. The chart provisions a
+  # per-namespace PKI (selfSigned Issuer -> CA -> CA Issuer) in
+  # .Values.namespace and the controller-manager runs with
+  # --migration-mtls-enabled=true, issuing one leaf Certificate per worker
+  # node. cert-manager must ALREADY be installed and its CRDs established, on
+  # every cluster running this chart, before you flip this — the templates
+  # render Issuer/Certificate objects and the install fails if those kinds do
+  # not exist. It is not a soft or optional dependency, and there is no
+  # fallback path.
+  #
+  # It stays OFF by default deliberately: a default install should not acquire
+  # a cluster-wide operator dependency it did not ask for. Turn it on where the
+  # pod network is untrusted and you already run cert-manager.
+  #
+  # See docs/migration/ for the transport detail (a stunnel sidecar; CH's own
+  # native migration TLS was evaluated and rejected — it connects by DNS name,
+  # which UDN/OVN-K launcher pods cannot resolve).
   mtls:
     enabled: false
+
+# SwiftGuest admission policy.
+swiftGuest:
+  # Host-path prefixes a SwiftGuest may mount into its launcher pod, via
+  # spec.filesystems[].source.hostPath (virtio-fs share) or a vhost-user socket
+  # directory.
+  #
+  # The launcher container is privileged, so a host path it mounts is
+  # effectively node-root access granted to whoever authored the SwiftGuest.
+  # An EMPTY list (the default) denies every host path: these fields are niche,
+  # so a cluster opts in explicitly rather than shipping an escape hatch.
+  # ".." is always rejected, and prefixes match whole path segments
+  # ("/srv/vm" allows "/srv/vm/a" but not "/srv/vmsecrets").
+  #
+  # Enforced by the controller, which refuses to build the launcher pod, and
+  # also at admission when webhook.enabled=true.
+  #
+  #   allowedHostPathPrefixes:
+  #     - /srv/kubeswift-shares
+  allowedHostPathPrefixes: []

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"connectrpc.com/connect"
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -101,40 +102,50 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Audit: every RPC is recorded; mutations unconditionally, reads at V(1).
+	// The gateway previously logged nothing at all, which is why a SwiftGuest
+	// deletion could not be attributed after the fact. See internal/gateway/audit.go.
+	audit := connect.WithInterceptors(gateway.NewAuditInterceptor(
+		ctrl.Log.WithName("kubeswift-gateway").WithName("audit"), auth))
+
 	clusterSvc := gateway.NewClusterService(mgr.GetClient(), *clustersNS, watcher, pool, auth)
-	clusterPath, clusterHandler := kubeswiftv1connect.NewClusterServiceHandler(clusterSvc)
+	clusterPath, clusterHandler := kubeswiftv1connect.NewClusterServiceHandler(clusterSvc, audit)
 
 	guestSvc := gateway.NewGuestService(pool, auth)
-	guestPath, guestHandler := kubeswiftv1connect.NewGuestServiceHandler(guestSvc)
+	guestPath, guestHandler := kubeswiftv1connect.NewGuestServiceHandler(guestSvc, audit)
 
 	// Migrations (P2): read plane over SwiftMigrations (the UI polls it live).
 	migSvc := gateway.NewMigrationService(pool, auth)
-	migPath, migHandler := kubeswiftv1connect.NewMigrationServiceHandler(migSvc)
+	migPath, migHandler := kubeswiftv1connect.NewMigrationServiceHandler(migSvc, audit)
 
 	// Telemetry (P1): per-VM range metrics from each member's Prometheus.
 	telSvc := gateway.NewTelemetryService(pool, auth)
-	telPath, telHandler := kubeswiftv1connect.NewTelemetryServiceHandler(telSvc)
+	telPath, telHandler := kubeswiftv1connect.NewTelemetryServiceHandler(telSvc, audit)
 
 	// Explorer (P2): read-only generic resource browser (nodes, namespaces,
 	// networking, storage, secrets — metadata only — and the KubeSwift CRDs).
 	resSvc := gateway.NewResourceService(pool, auth)
-	resPath, resHandler := kubeswiftv1connect.NewResourceServiceHandler(resSvc)
+	resPath, resHandler := kubeswiftv1connect.NewResourceServiceHandler(resSvc, audit)
 
 	// Access (B3): the RBAC editor backend — list/create KubeSwift roles + assign
 	// them to OIDC users/groups (cluster-wide or per-namespace), as the user.
 	accessSvc := gateway.NewAccessService(pool, auth)
-	accessPath, accessHandler := kubeswiftv1connect.NewAccessServiceHandler(accessSvc)
+	accessPath, accessHandler := kubeswiftv1connect.NewAccessServiceHandler(accessSvc, audit)
 	// Console stays a P0 stub (CodeUnimplemented) until the console plane lands.
-	conPath, conHandler := kubeswiftv1connect.NewConsoleServiceHandler(kubeswiftv1connect.UnimplementedConsoleServiceHandler{})
+	conPath, conHandler := kubeswiftv1connect.NewConsoleServiceHandler(kubeswiftv1connect.UnimplementedConsoleServiceHandler{}, audit)
 
 	// Console plane (D5 bootstrap): a raw WebSocket at /console that exec-bridges
 	// the guest's serial socket. Not a Connect RPC — browsers can't do bidi
 	// Connect — so it rides RawHandlers, not the generated ConsoleService stub.
-	consoleWS := gateway.NewConsoleHandler(pool, auth)
+	// Cross-origin policy for the raw-WS planes. With a real auth mode the
+	// bearer is the control and "*" is honoured; auth-mode=insecure has no
+	// bearer at all, so Origin becomes the only control and "*" is refused.
+	wsOrigin := gateway.NewOriginPolicy(*corsOrigin, *authMode)
+	consoleWS := gateway.NewConsoleHandler(pool, auth, wsOrigin)
 	// Sandbox logs plane: a raw WebSocket at /sandbox-logs that exec-tails the
 	// microVM's captured console log (read-only). Same raw-WS rationale as /console.
-	sandboxLogsWS := gateway.NewSandboxLogsHandler(pool, auth)
-	sandboxExecWS := gateway.NewSandboxExecHandler(pool, auth)
+	sandboxLogsWS := gateway.NewSandboxLogsHandler(pool, auth, wsOrigin)
+	sandboxExecWS := gateway.NewSandboxExecHandler(pool, auth, wsOrigin)
 
 	srv := &gateway.Server{
 		Addr:          *listen,

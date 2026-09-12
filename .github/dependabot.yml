@@ -1,0 +1,127 @@
+version: 2
+
+# Phase 1 of #466. Dependabot is the other half of govulncheck/cargo-audit:
+# those tell us we are exposed, this proposes the upgrade.
+#
+# Weekly, grouped, and capped deliberately. Ungrouped daily updates across four
+# ecosystems produce more PRs than anyone reviews, and unreviewed dependency PRs
+# are worse than none — they train people to merge dependency changes without
+# looking, which is exactly the habit a supply-chain attack relies on.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    # INDIRECT dependencies too, not only direct ones. Dependabot's default for
+    # gomod is `dependency-type: direct`, and three of the fixable HIGH CVEs
+    # that blocked PRs this cycle were in INDIRECT requirements:
+    #
+    #   google.golang.org/grpc  CVE-2026-84304          (fixed in #567)
+    #   golang.org/x/mod        CVE-2026-56864/56865    (fixed in #568)
+    #
+    # Nothing ever proposed either fix. Both surfaced as a red Trivy gate on an
+    # unrelated PR, were diagnosed by hand, and were patched by hand. govulncheck
+    # and the image scan tell us we are exposed; this is what proposes the
+    # upgrade, and it could not see the dependencies that were actually
+    # vulnerable.
+    #
+    # Cost: more PRs. That is the trade this file already makes elsewhere
+    # (weekly, grouped, capped) -- and the groups below absorb most of it.
+    allow:
+      - dependency-type: all
+    groups:
+      # k8s libraries move in lockstep; separate PRs for each would not build.
+      #
+      # exclude-patterns on go-minor-patch below is what actually keeps them
+      # together. This group has existed since Phase 1 and has NEVER produced a
+      # PR: every k8s.io bump, including the 0.36.4 -> 0.37.0 minor in #568,
+      # arrived inside go-minor-patch instead. A catch-all group with no
+      # `patterns` matches everything, so whichever of the two Dependabot
+      # evaluates first claims the dependency -- and declaration order is not
+      # reliably what decides that (note that go-minor-patch sorts before
+      # kubernetes alphabetically, while cargo's kube-rs sorts before
+      # rust-minor-patch, which is the difference between the broken config and
+      # the working one).
+      #
+      # Rather than depend on an ordering rule we cannot verify from here, the
+      # catch-all now EXCLUDES these patterns outright. That is correct under
+      # either ordering, which is the point.
+      kubernetes:
+        patterns: ["k8s.io/*", "sigs.k8s.io/*"]
+      go-minor-patch:
+        exclude-patterns: ["k8s.io/*", "sigs.k8s.io/*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /rust
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    groups:
+      # kube and k8s-openapi are VERSION-LOCKED — kube declares an exact-minor
+      # requirement on k8s-openapi (kube 0.92 -> ^0.22, kube 4.2 -> ^0.28), so
+      # bumping either alone always breaks the build. Ungrouped, Dependabot
+      # opened them as two separate PRs (#484, #485) that could not pass
+      # individually AND did not combine into a working pair: #484 offered
+      # k8s-openapi 0.24 while #485's kube 4.2 needed 0.28. Both were closed.
+      #
+      # Listed FIRST because Dependabot assigns a dependency to the first group
+      # it matches, and rust-minor-patch below has no `patterns` so it would
+      # otherwise swallow the minor/patch updates of these two.
+      #
+      # update-types includes major so the pair also travels together across a
+      # major bump — the case that actually broke.
+      kube-rs:
+        patterns:
+          - "kube"
+          - "kube-*"
+          - "k8s-openapi"
+        update-types: [major, minor, patch]
+
+      # Excluded here for the same reason go-minor-patch excludes k8s.io/*: a
+      # catch-all with no `patterns` can otherwise claim these before the
+      # specific group above is considered. This pair currently lands in
+      # kube-rs correctly, so this changes no outcome today -- it stops that
+      # from depending on which group Dependabot happens to evaluate first.
+      rust-minor-patch:
+        exclude-patterns: ["kube", "kube-*", "k8s-openapi"]
+        update-types: [minor, patch]
+
+  # The supply-chain one that matters most: a compromised action in a workflow
+  # holding `packages: write` can republish every image we ship. Pinned to SHAs
+  # (also Phase 1), so Dependabot is what moves those pins forward.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    groups:
+      # codeql-action/{init,analyze,upload-sarif} are ONE tool split across three
+      # action paths, and init/analyze refuse to interoperate across versions:
+      #
+      #   Loaded a configuration file for version '4.31.0', but running version '4.37.6'
+      #
+      # Ungrouped, Dependabot opens a PR per sub-action, and each one is red on
+      # its own because it desyncs the trio. That happened twice: #506 (analyze
+      # alone) and #540/#541 (analyze and init, as two PRs that still could not
+      # be combined into a complete set — the third bump never even appeared,
+      # because five other github-actions PRs were open and hit the limit above).
+      #
+      # Grouped, the trio arrives as one mergeable PR and the pins cannot drift.
+      codeql-action:
+        patterns: ["github/codeql-action*"]
+        update-types: [major, minor, patch]
+
+  # Base images for the 9 published containers. swiftletd is the one to watch:
+  # it carries Cloud Hypervisor and QEMU and runs privileged.
+  - package-ecosystem: docker
+    directories:
+      - /images/controller-manager
+      - /images/swiftletd
+      - /images/kubeswift-gateway
+      - /images/gpu-discovery
+      - /images/sandbox-materialize
+      - /images/snapshot-s3
+      - /images/snapshot-oras
+      - /images/migration-stunnel
+      - /images/kubeswift-dra-driver
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5

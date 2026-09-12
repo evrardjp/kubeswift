@@ -50,6 +50,7 @@ Represents a running virtual machine instance.
 | `seedProfileRef.name` | string | No | — | SwiftSeedProfile for cloud-init (disk boot only). Optional. |
 | `runPolicy` | enum | No | `Running` | `Running`, `Stopped`, `RestartOnFailure`, or `Always`. |
 | `gpuProfileRef.name` | string | No | — | SwiftGPUProfile for GPU passthrough. Mutually exclusive with `kernelRef`. |
+| `schedulerName` | string | No | — | kube-scheduler profile for the launcher pod. Use a profile with the `NodeResourcesFit` `LeastAllocated` strategy to bias placement toward less-loaded nodes. Ignored when `nodeName` pins the guest. An unknown name leaves the pod Pending — KubeSwift cannot validate it, since scheduler profiles are not exposed through the API. |
 
 **RunPolicy values:**
 
@@ -126,6 +127,10 @@ Cluster-scoped template defining default CPU, memory, and disk resources for VMs
 | `memory` | Quantity | Yes | Memory size (e.g. `"2Gi"`). |
 | `rootDisk.size` | Quantity | Yes | Root disk PVC size (e.g. `"40Gi"`). Should match SwiftImage's `rootDisk.size`. |
 | `rootDisk.format` | enum | Yes | `raw` only at runtime. |
+| `coreScheduling` | enum | No | `off` (default), `vm`, `vcpu` — SMT side-channel isolation: who may share a physical core. |
+| `cpuPinning` | enum | No | `none` (default), `static` — pin each vCPU to one host CPU from the launcher pod's cpuset. See [CPU pinning](performance/cpu-pinning.md). |
+| `smtPolicy` | enum | No | `spread` (default), `pack` — which SMT siblings a pinned guest uses. Ignored unless `cpuPinning: static`. |
+| `hugepages` | enum | No | `""` (default), `2Mi`, `1Gi` — back guest RAM with hugepages instead of 4K pages. The launcher then requests `hugepages-<size>` equal to the guest's memory, so the node must have the pages reserved or the pod will not schedule. See [hugepages](performance/hugepages.md). |
 
 ### Example
 
@@ -212,7 +217,7 @@ cloud-init NoCloud datasource configuration. Rendered to a seed ISO and mounted 
 | `datasource` | enum | Yes | Only `NoCloud` is supported. |
 | `userData` | string | No | Inline cloud-config YAML. |
 | `userDataFrom` | SeedDataValueFrom | No | Reference to Secret or ConfigMap key. |
-| `metaData` | string | No | Inline instance metadata YAML. |
+| `metaData` | string | No | Inline instance metadata YAML. **Defaulted when omitted** (`instance-id: <namespace>-<guest>`, `local-hostname: <guest>`) — a NoCloud disk with no `meta-data` file is not recognised as a datasource, and cloud-init would silently discard `userData` while the guest still booted and reported Ready. Set it only to override. |
 | `metaDataFrom` | SeedDataValueFrom | No | Reference to Secret or ConfigMap key. |
 | `networkData` | string | No | Inline network configuration. |
 | `networkDataFrom` | SeedDataValueFrom | No | Reference to Secret or ConfigMap key. |
@@ -430,6 +435,7 @@ Manages a fleet of identical VMs with ReplicaSet-style semantics: rolling update
 | `template` | SwiftGuestTemplateSpec | The per-replica SwiftGuest spec (boot source, class, seed, etc.). |
 | `updateStrategy` | UpdateStrategy | Rolling-update parameters (e.g. `maxUnavailable`, `maxSurge`). |
 | `spreadPolicy` / `topologySpreadConstraints` | string / []TopologySpreadConstraint | How replicas are spread across nodes/zones. |
+| `template.spec.schedulerName` | string | Routes every replica to a named scheduler profile — the utilization-aware complement to topology spread, which only counts pods. See the [guide](swiftguestpool-guide.md). |
 | `volumeClaimTemplates` | []PersistentVolumeClaimTemplate | Per-replica PVCs (owned by the pool, not the individual SwiftGuests). |
 | `service` | PoolServiceSpec | One load-balanced Service across all replicas (`ports`, `type`, `headless`). See [Service exposure](networking/service-exposure.md). |
 
@@ -488,7 +494,7 @@ Cron-creates SwiftSnapshots of a guest and prunes to a kept count (composes with
 
 | Key field | Type | Description |
 |-----------|------|-------------|
-| `schedule` | string | Standard cron expression (UTC). |
+| `schedule` | string | Standard cron expression, evaluated in UTC regardless of the controller pod's timezone. Prefix with `CRON_TZ=` to use another zone (e.g. `CRON_TZ=Europe/Rome 0 2 * * *`). |
 | `suspend` | bool | Pause the schedule without deleting it. |
 | `concurrencyPolicy` | enum | `Forbid` (default) skips a tick while a prior snapshot is in-flight. |
 | `startingDeadlineSeconds` | int64 | Skip a missed tick older than this. |

@@ -12,6 +12,7 @@ import (
 	"github.com/robfig/cron/v3"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	snapshotv1alpha1 "github.com/kubeswift-io/kubeswift/api/snapshot/v1alpha1"
+	"github.com/kubeswift-io/kubeswift/internal/snapshot/cronspec"
 )
 
 const (
@@ -54,20 +56,37 @@ func (r *SwiftSnapshotScheduleReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	status := sched.Status.DeepCopy()
+
 	if sched.Spec.Suspend {
+		setReady(status, &sched, metav1.ConditionFalse, "Suspended",
+			"spec.suspend is set; no snapshots are created while suspended")
+		if err := r.persistStatus(ctx, &sched, status); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: suspendedRequeue}, nil
 	}
 
-	cronSched, err := cron.ParseStandard(sched.Spec.Schedule)
+	cronSched, err := parseScheduleUTC(sched.Spec.Schedule)
 	if err != nil {
-		// Invalid cron (the webhook rejects this once it lands). Don't hot-loop —
-		// the schedule is re-reconciled when the spec is fixed.
+		// Invalid cron. Don't hot-loop — the schedule is re-reconciled when the
+		// spec is fixed.
+		//
+		// The condition is the whole point of this branch. Without it the failure
+		// is invisible: the validating webhook is off by default, so a malformed
+		// spec.schedule reaches the controller, and returning here leaves an
+		// object that reads as perfectly healthy under `kubectl get` — schedule,
+		// suspend, guest and age all populated — which never fires a snapshot.
+		// The only other trace is this log line.
 		logger.Error(err, "invalid spec.schedule; not scheduling", "schedule", sched.Spec.Schedule)
+		setReady(status, &sched, metav1.ConditionFalse, "InvalidSchedule", err.Error())
+		if perr := r.persistStatus(ctx, &sched, status); perr != nil {
+			return ctrl.Result{}, perr
+		}
 		return ctrl.Result{}, nil
 	}
 
 	now := r.clock()
-	status := sched.Status.DeepCopy()
 
 	// Refresh observed status (active + lastSuccessfulTime) from owned snapshots.
 	children, err := r.ownedSnapshots(ctx, &sched)
@@ -99,6 +118,9 @@ func (r *SwiftSnapshotScheduleReconciler) Reconcile(ctx context.Context, req ctr
 		}
 	}
 
+	setReady(status, &sched, metav1.ConditionTrue, "Scheduled",
+		fmt.Sprintf("schedule %q is valid; a snapshot is created on each tick", sched.Spec.Schedule))
+
 	if err := r.persistStatus(ctx, &sched, status); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -114,14 +136,27 @@ func (r *SwiftSnapshotScheduleReconciler) Reconcile(ctx context.Context, req ctr
 	return ctrl.Result{RequeueAfter: requeueToNext(cronSched, now)}, nil
 }
 
+// parseScheduleUTC parses a 5-field cron expression, pinned to UTC.
+//
+// Delegates to cronspec.Parse so the controller and the admission webhook
+// cannot drift: the webhook is off by default, which makes this the path a
+// malformed spec.schedule actually reaches.
+func parseScheduleUTC(spec string) (cron.Schedule, error) {
+	return cronspec.Parse(spec)
+}
+
 // mostRecentDue returns the latest scheduled time in (earliest, now], and
 // whether one exists. It fires at most once per reconcile (the most recent
 // missed tick), coalescing a backlog after an outage rather than stampeding.
+//
+// A zero Next means no occurrence within the five years cron searches, so
+// nothing is due. Unguarded it precedes every "now" and reads as permanently
+// due — one snapshot named for year 1 per reconcile.
 func mostRecentDue(sched cron.Schedule, earliest, now time.Time) (time.Time, bool) {
 	var due time.Time
 	found := false
 	t := sched.Next(earliest)
-	for i := 0; !t.After(now); i++ {
+	for i := 0; !t.IsZero() && !t.After(now); i++ {
 		due, found = t, true
 		if i >= missedTickCap {
 			break
@@ -139,8 +174,16 @@ func tooLate(sched *snapshotv1alpha1.SwiftSnapshotSchedule, tick, now time.Time)
 
 // requeueToNext returns the capped wait until the next scheduled time
 // (computed from the injected now, not the wall clock).
+//
+// No next occurrence means nothing to wait for, so re-check at the slow cadence.
+// Subtracting the zero time instead gives a vast negative wait that clamps to
+// the one-second floor and busy-loops the reconciler.
 func requeueToNext(sched cron.Schedule, now time.Time) time.Duration {
-	wait := sched.Next(now).Sub(now)
+	next := sched.Next(now)
+	if next.IsZero() {
+		return maxRequeue
+	}
+	wait := next.Sub(now)
 	if wait < time.Second {
 		wait = time.Second
 	}
@@ -242,6 +285,24 @@ func hasInFlight(children []snapshotv1alpha1.SwiftSnapshot) bool {
 func setLastSchedule(status *snapshotv1alpha1.SwiftSnapshotScheduleStatus, t time.Time) {
 	mt := metav1.NewTime(t)
 	status.LastScheduleTime = &mt
+}
+
+// setReady records the Ready condition on the status copy.
+//
+// Messages are derived from spec, never from the clock. persistStatus compares
+// whole statuses, so any part of a condition that differs between two otherwise
+// identical reconciles turns every requeue into a status write.
+// SetStatusCondition only moves LastTransitionTime when Status changes, so with
+// stable messages a steady-state reconcile produces an identical status and no
+// API call at all.
+func setReady(status *snapshotv1alpha1.SwiftSnapshotScheduleStatus, sched *snapshotv1alpha1.SwiftSnapshotSchedule, state metav1.ConditionStatus, reason, msg string) {
+	apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               snapshotv1alpha1.SwiftSnapshotScheduleConditionReady,
+		Status:             state,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: sched.Generation,
+	})
 }
 
 func (r *SwiftSnapshotScheduleReconciler) persistStatus(ctx context.Context, sched *snapshotv1alpha1.SwiftSnapshotSchedule, status *snapshotv1alpha1.SwiftSnapshotScheduleStatus) error {

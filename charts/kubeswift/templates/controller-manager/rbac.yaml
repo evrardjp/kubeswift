@@ -69,11 +69,15 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # secrets — get,list,watch for general reads; create,update added for
-  # the Phase 3c live-migration mTLS path (migration.mtls.enabled): the
-  # migrationcert controller copies a node's cert-manager-issued identity
-  # Secret into guest namespaces (distribution, not issuance). The verbs
-  # are harmless when mTLS is disabled (the reconciler is not registered).
+  # secrets — get,list,watch for general reads. create,update have two
+  # consumers:
+  #   1. the rendered cloud-init seed, which is a Secret rather than a
+  #      ConfigMap (user-data carries SSH keys, passwords and join tokens,
+  #      and a seed profile can source it from a Secret);
+  #   2. the live-migration mTLS path (migration.mtls.enabled): the
+  #      migrationcert controller copies a node's cert-manager-issued
+  #      identity Secret into guest namespaces (distribution, not issuance),
+  #      and is not registered at all when mTLS is disabled.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update"]
@@ -182,9 +186,39 @@ rules:
   # operator-applied RoleBinding pattern (snapshot walkthrough finding
   # F2 + Phase 2 walkthrough finding W3). list+watch are required by
   # controller-runtime's cached client (Phase 2 W3 follow-up).
+  # core ServiceAccounts — the controller creates the per-namespace launcher
+  # SAs (kubeswift-launcher / kubeswift-sandbox-launcher) so a launcher pod no
+  # longer runs as the namespace `default` SA (#443). list+watch are REQUIRED,
+  # not optional: controller-runtime's cached client opens an informer per
+  # GETable type and blocks indefinitely without them — the same trap as W7
+  # (rolebindings) and W8 (storageclasses).
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    verbs: ["get", "list", "watch", "create"]
+    # `delete` is for the #515 narrowing only: retiring the shared
+    # namespace-wide launcher binding once per-pod grants exist. Scoped
+    # Roles/RoleBindings are reaped by ownerReference GC, not by us.
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # rbac.authorization.k8s.io Roles — the per-launcher-pod scoped grant (#515):
+  # a Role naming exactly one pod in resourceNames, owned by the workload CR.
+  #
+  # NO `escalate` verb, deliberately. Kubernetes forbids creating a Role that
+  # grants more than the creator holds, and the security review removed
+  # `escalate` from this ClusterRole on purpose. That constraint is satisfied
+  # WITHOUT it because the controller already holds everything the scoped Role
+  # grants — pods get/patch and swiftguests/status get/patch, both above. If a
+  # future rule widens the scoped Role beyond what the controller itself holds,
+  # Role creation will start failing with a 403 rather than silently escalating,
+  # and that is the correct outcome.
+  #
+  # list+watch are REQUIRED, not optional: controller-runtime's cached client
+  # opens an informer per GETable type and blocks indefinitely without them —
+  # the same trap as W7 (rolebindings) and W8 (storageclasses).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    verbs: ["get", "list", "watch", "create", "update"]
   # cert-manager.io Certificates — the Phase 3c migrationcert controller
   # (migration.mtls.enabled) creates one per-node leaf Certificate
   # (SAN=nodeName, Option B) and deletes stale ones. list+watch are
@@ -228,7 +262,24 @@ metadata:
 rules:
   - apiGroups: ["swift.kubeswift.io"]
     resources: ["swiftguests/status"]
-    verbs: ["get", "patch", "update"]
+    verbs: ["get", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "patch", "update"]
+    verbs: ["get", "patch"]
+---
+# The SANDBOX launcher's role. Strictly smaller than the guest reporter: no
+# swiftguests/status. A sandbox sets KUBESWIFT_REPORT_GUEST_CR=false and never
+# patches a SwiftGuest, and it is the workload class that runs untrusted code —
+# granting it status:patch would let an escaped sandbox forge GuestRunning or
+# Failed on any SwiftGuest in the namespace, which the controller state machine
+# and the drain path both consume. (#443)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeswift-sandbox-reporter
+  labels:
+    app.kubernetes.io/name: kubeswift
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]

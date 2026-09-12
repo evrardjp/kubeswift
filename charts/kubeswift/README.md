@@ -20,11 +20,14 @@ them — re-apply `config/crd/bases/*.yaml` after a chart upgrade that changes a
 | `webhook.enabled`, `migration.mtls.enabled`, `ingress.tlsAuto` | cert-manager installed cluster-side |
 | `monitoring.enabled` | Prometheus Operator CRDs (e.g. kube-prometheus-stack); dashboards need a Grafana with the dashboard sidecar |
 | `gpuDiscovery.enabled` / `dra.enabled` | nodes labeled `kubeswift.io/gpu-node=true`; DRA also needs CDI enabled in the runtime + the `vfio-pci` module |
+| `launcherSAGate.enabled` (**on by default**) | Kubernetes ≥ 1.30 for `ValidatingAdmissionPolicy`. On older clusters it is silently skipped — see the note below |
 
 **Image tags** — the operator images default to `tag: latest`, which the chart
 rewrites to the chart's own `v<appVersion>` for a release (or `sha-<commit>` for a
 dev build). Only override for locally-built images. The `kubeswift-ui` image is
-released from a separate repo and is **not** chart-derived — pin `ui.image.tag`.
+released from a separate repo and is **not** chart-derived: `ui.image.tag` ships
+pinned, and a chart upgrade does not move it — raise it when you want a newer
+console. `v0.12.3` is the floor (the UI Deployment runs read-only-root).
 See [`docs/install/helm-oci.md`](../../docs/install/helm-oci.md).
 
 ## Common configurations
@@ -33,8 +36,13 @@ See [`docs/install/helm-oci.md`](../../docs/install/helm-oci.md).
 # Minimal operator only (default)
 helm install kubeswift … 
 
-# Management hub: gateway + web console + self-register this cluster
-helm install kubeswift … --set federation.role=hub
+# Management hub: gateway + web console + self-register this cluster.
+# The gateway defaults to authMode=oidc, which needs your IdP (docs/ui/auth.md).
+helm install kubeswift … --set federation.role=hub \
+  --set gateway.oidc.issuerURL=https://keycloak.example.com/realms/kubeswift \
+  --set gateway.oidc.clientID=kubeswift-gateway \
+  --set ui.oidc.issuer=https://keycloak.example.com/realms/kubeswift \
+  --set ui.oidc.clientId=kubeswift-gateway
 
 # Federated member (edge): mints a join credential; NOTES prints the hub manifest
 helm install kubeswift … --set federation.role=edge \
@@ -48,6 +56,10 @@ helm upgrade kubeswift … --set monitoring.enabled=true \
 
 `helm upgrade` reuses previously-set values only when you pass none; pass
 `--reset-values` to drop old overrides.
+
+The chart rejects values keys it does not read (`values.schema.json`). A typo,
+or a stale key that `helm get values` carries into every upgrade, fails with the
+key named instead of being silently ignored. Delete the key.
 
 ## Values
 
@@ -65,6 +77,8 @@ helm upgrade kubeswift … --set monitoring.enabled=true \
 | `swiftletd.image.registry` | Launcher image registry | `ghcr.io/kubeswift-io/kubeswift` |
 | `swiftletd.image.tag` | Launcher image tag (as above) | `latest` |
 | `swiftletd.resources` | Requests/limits | `100m`/`128Mi` … `2`/`2Gi` |
+| `swiftletd.imagePullSecrets` | Pull Secrets for the launcher image on a private registry. Launcher pods run as their own ServiceAccount, so they do not inherit Secrets patched onto `default` | `[]` |
+| `sandboxMaterialize.image.registry` / `.tag` | SwiftSandbox rootfs init container, injected into sandbox pods by the controller | `ghcr.io/kubeswift-io/kubeswift` / `latest` |
 
 ### Snapshot backend images
 
@@ -124,9 +138,10 @@ still adds that component in any role. See [`docs/ui/gateway.md`](../../docs/ui/
 | `gateway.image.registry` / `.tag` | Gateway image | `ghcr.io/kubeswift-io/kubeswift` / `latest` |
 | `gateway.replicas` | Gateway replicas | `1` |
 | `gateway.port` | Container port | `8080` |
-| `gateway.authMode` | End-user auth: `oidc` (verify IdP token, impersonate) · `token` (bearer via TokenReview) · `insecure` (no per-user impersonation — **dev/lab only**) | `insecure` |
-| `gateway.oidc.issuerURL` | (authMode=oidc) IdP issuer, reachable from browser **and** gateway | `""` |
-| `gateway.oidc.clientID` | Client ID / audience the ID token must carry | `""` |
+| `gateway.authMode` | End-user auth: `oidc` (verify IdP token, impersonate) · `token` (bearer via TokenReview) · `insecure` (no authentication at all — **dev/lab only**) | `oidc` |
+| `gateway.allowInsecureIngress` | Accept `authMode=insecure` on a reachable gateway (a gateway or UI ingress, or a LoadBalancer/NodePort Service for either). Without it the chart refuses that combination, which publishes an unauthenticated control plane | `false` |
+| `gateway.oidc.issuerURL` | (authMode=oidc, required) IdP issuer, reachable from browser **and** gateway | `""` |
+| `gateway.oidc.clientID` | (authMode=oidc, required) Client ID / audience the ID token must carry | `""` |
 | `gateway.oidc.usernameClaim` | Claim used as the impersonated username | `email` |
 | `gateway.oidc.groupsClaim` | Claim used as the impersonated groups | `groups` |
 | `gateway.oidc.usernamePrefix` / `.groupsPrefix` | Mirror the apiserver `--oidc-*-prefix` flags | `""` |
@@ -152,7 +167,7 @@ point `ui.gateway.url` at an externally reachable gateway).
 |---|---|---|
 | `ui.enabled` | Deploy the web console (auto-on for `role=hub`) | `false` |
 | `ui.image.repository` | UI image repo (a top-level package, not chart-derived) | `ghcr.io/kubeswift-io/kubeswift-ui` |
-| `ui.image.tag` | Published UI tag — **pin a version for production** | `latest` |
+| `ui.image.tag` | Published UI tag (not chart-derived; `v0.12.3` is the floor for read-only-root) | `v0.12.4` |
 | `ui.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ui.imagePullSecrets` | Pull Secret(s) if the UI package is private | `[]` |
 | `ui.replicas` | UI replicas | `1` |
@@ -160,7 +175,7 @@ point `ui.gateway.url` at an externally reachable gateway).
 | `ui.gateway.service` / `.port` | (proxy mode) In-cluster gateway Service name + port | `kubeswift-gateway` / `8080` |
 | `ui.gateway.url` | (url mode) Absolute, browser-reachable gateway URL | `""` |
 | `ui.oidc.issuer` | Browser login issuer — must match `gateway.oidc.issuerURL` | `""` |
-| `ui.oidc.clientId` | Public OIDC client the browser logs in with | `""` |
+| `ui.oidc.clientId` | Public OIDC client the browser logs in with. Login is on only when this and `ui.oidc.issuer` are both set | `""` |
 | `ui.service.type` / `.port` | UI Service | `ClusterIP` / `80` |
 | `ui.ingress.enabled` | Create an Ingress for the UI | `false` |
 | `ui.ingress.className` | `ingressClassName` | `""` |
@@ -175,6 +190,48 @@ point `ui.gateway.url` at an externally reachable gateway).
 | Parameter | Description | Default |
 |---|---|---|
 | `webhook.enabled` | Enable admission webhooks (runs the controller with `--webhook-enabled=true`). Requires cert-manager | `false` |
+| `swiftGuest.allowedHostPathPrefixes` | Host-path prefixes a SwiftGuest may mount (virtio-fs `hostPath` shares, vhost-user socket directories). Empty denies every host path. Enforced by the controller, and at admission too when `webhook.enabled` | `[]` |
+| `launcherSAGate.enabled` | Refuse any Pod that names a launcher ServiceAccount unless the KubeSwift controller creates it. **Closes a privilege escalation — see below before disabling** | `true` |
+| `launcherSAGate.guestServiceAccountName` | Guest launcher SA the gate protects. Must match what the controller stamps | `kubeswift-launcher` |
+| `launcherSAGate.sandboxServiceAccountName` | Sandbox launcher SA the gate protects | `kubeswift-sandbox-launcher` |
+
+**Why `launcherSAGate` is on by default.** Launcher pods run privileged and are a
+node-level trust boundary. swiftletd needs `pods: patch` to report status, so the
+launcher ServiceAccounts carry it — and Kubernetes has **no RBAC gate on which
+ServiceAccount a pod may name**. Without this policy, anyone who can create a Pod
+in a namespace where a guest or sandbox runs can name that ServiceAccount, take
+its token, patch the privileged launcher's image, and reach node root. Scoping
+the RBAC with `resourceNames` does not close it (RBAC is additive and the
+ServiceAccount is shared).
+
+Turn it off only if a policy engine of your own enforces the same rule, or you
+already operate those namespaces as a trust boundary. Where it is off — including
+on clusters below Kubernetes 1.30, where it does not render — **treat anyone who
+can create a Pod in a KubeSwift workload namespace as a node administrator**. See
+`docs/security-audit.md`.
+
+### Per-launcher-pod RBAC
+
+| Parameter | Description | Default |
+|---|---|---|
+| `scopedLauncherRBAC.enabled` | Retire the shared namespace-wide launcher RoleBinding, leaving each launcher pod with a Role scoped to **only its own pod**. Defence in depth — read below | `false` |
+
+The controller **always** creates the per-pod Role + RoleBinding, for guests,
+migration targets, sandboxes and warm pool slots alike. That alone narrows
+nothing: RBAC is a union, so while the shared binding also exists a launcher
+keeps namespace-wide access. Enabling this deletes that shared binding.
+
+It is **not** what closes the escalation above — the `launcherSAGate` policy is.
+RBAC is additive on a shared ServiceAccount, so scoping cannot stop an attacker
+who obtains the token by naming the SA. What it buys is that a token leaked some
+*other* way (a stolen projected token, a compromised node) is worth one pod
+rather than the whole namespace.
+
+Off by default because turning it on deletes a live grant. A pool converges
+grants for the slots it already has, so enabling it on a running pool does not
+cut off live slots. Cost is two objects per launcher pod, garbage-collected with
+it. If the shared binding cannot be removed the controller logs at ERROR and
+keeps going — it never blocks a workload from booting.
 
 ### Observability
 
