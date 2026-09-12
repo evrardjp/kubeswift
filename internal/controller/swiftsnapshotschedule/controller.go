@@ -148,11 +148,15 @@ func parseScheduleUTC(spec string) (cron.Schedule, error) {
 // mostRecentDue returns the latest scheduled time in (earliest, now], and
 // whether one exists. It fires at most once per reconcile (the most recent
 // missed tick), coalescing a backlog after an outage rather than stampeding.
+//
+// A zero Next means no occurrence within the five years cron searches, so
+// nothing is due. Unguarded it precedes every "now" and reads as permanently
+// due — one snapshot named for year 1 per reconcile.
 func mostRecentDue(sched cron.Schedule, earliest, now time.Time) (time.Time, bool) {
 	var due time.Time
 	found := false
 	t := sched.Next(earliest)
-	for i := 0; !t.After(now); i++ {
+	for i := 0; !t.IsZero() && !t.After(now); i++ {
 		due, found = t, true
 		if i >= missedTickCap {
 			break
@@ -170,8 +174,16 @@ func tooLate(sched *snapshotv1alpha1.SwiftSnapshotSchedule, tick, now time.Time)
 
 // requeueToNext returns the capped wait until the next scheduled time
 // (computed from the injected now, not the wall clock).
+//
+// No next occurrence means nothing to wait for, so re-check at the slow cadence.
+// Subtracting the zero time instead gives a vast negative wait that clamps to
+// the one-second floor and busy-loops the reconciler.
 func requeueToNext(sched cron.Schedule, now time.Time) time.Duration {
-	wait := sched.Next(now).Sub(now)
+	next := sched.Next(now)
+	if next.IsZero() {
+		return maxRequeue
+	}
+	wait := next.Sub(now)
 	if wait < time.Second {
 		wait = time.Second
 	}

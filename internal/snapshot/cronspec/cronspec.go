@@ -35,7 +35,40 @@ func Parse(spec string) (cron.Schedule, error) {
 	if ss, ok := sched.(*cron.SpecSchedule); ok && !namesTimezone(spec) {
 		ss.Location = time.UTC
 	}
+	if err := checkSatisfiable(sched, spec); err != nil {
+		return nil, err
+	}
 	return sched, nil
+}
+
+// satisfiableRef is the instant the check below probes from. Any instant gives
+// the same answer for a date that never occurs, and a fixed one keeps Parse
+// deterministic — no schedule starts being rejected depending on when it was
+// applied. Checked over all 2976 day-of-month × month × day-of-week
+// combinations against references from 1971 to 2090: no disagreement.
+var satisfiableRef = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// checkSatisfiable rejects a date that never occurs, such as "0 0 31 4 *" —
+// the 31st of April.
+//
+// cron accepts these and only fails to match them once running: after five
+// years of searching it returns the ZERO time rather than an error. A zero tick
+// precedes every "now", so it reads as permanently due.
+//
+// Exactly six are impossible: 30 and 31 February, and the 31st of April, June,
+// September and November. 29 February is not one of them — rare, not
+// impossible, and it must keep working.
+func checkSatisfiable(sched cron.Schedule, spec string) error {
+	// @every is an interval, not a calendar date. It always fires.
+	if _, ok := sched.(*cron.SpecSchedule); !ok {
+		return nil
+	}
+	if sched.Next(satisfiableRef).IsZero() {
+		return fmt.Errorf(
+			"cron expression %q can never fire: its day-of-month and month fields "+
+				"describe a date that does not exist, such as 31 April or 30 February", spec)
+	}
+	return nil
 }
 
 // checkTimezonePrefix rejects the one input shape that makes ParseStandard

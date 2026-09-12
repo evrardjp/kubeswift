@@ -51,6 +51,11 @@ credentials) — see [`config/samples/snapshot-schedule/02-schedule-s3-ttl.yaml`
 - **`startingDeadlineSeconds`** skips a tick missed by more than this (e.g. after
   an outage) instead of firing it late.
 - **`suspend: true`** pauses firing without deleting the schedule or its snapshots.
+- **A date that never occurs is refused**, rather than accepted and never fired:
+  30 or 31 February, and the 31st of April, June, September or November. Cron
+  considers these well-formed — 31 is a legal day and April a legal month — and
+  only fails to match them once running. 29 February is not one of them; it
+  fires in leap years.
 
 ## Retention — keep-N vs ttl
 
@@ -90,7 +95,7 @@ condition:
 | Ready | Reason | Meaning |
 |---|---|---|
 | `True` | `Scheduled` | `spec.schedule` parses; a snapshot is created on each tick. |
-| `False` | `InvalidSchedule` | `spec.schedule` does not parse — the schedule will never fire. `message` carries the parse error. |
+| `False` | `InvalidSchedule` | `spec.schedule` is unusable — it does not parse, or it names a date that never occurs. The schedule will never fire; `message` carries the reason. |
 | `False` | `Suspended` | `spec.suspend` is set. |
 
 `InvalidSchedule` is the one to watch for. The admission webhook that rejects a

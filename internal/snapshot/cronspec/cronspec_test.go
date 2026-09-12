@@ -1,6 +1,7 @@
 package cronspec
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -112,5 +113,84 @@ func TestParse_ExplicitZoneIsHonoured(t *testing.T) {
 	want := time.Date(2026, 6, 7, 2, 0, 0, 0, tokyo)
 	if got := sched.Next(from); !got.Equal(want) {
 		t.Errorf("next tick = %v (%v UTC), want %v", got, got.UTC(), want)
+	}
+}
+
+// The other shape cron accepts and cannot honour: a day-of-month and month that
+// never coincide. Silent, unlike a parse error — cron returns the ZERO time,
+// which precedes every "now", so the schedule reads as permanently due and
+// creates a snapshot named for year 1 on every reconcile.
+func TestParse_ImpossibleDatesAreRejected(t *testing.T) {
+	// The complete set. Every other day/month pair occurs at least once.
+	for _, spec := range []string{
+		"0 0 30 2 *",  // 30 February
+		"0 0 31 2 *",  // 31 February
+		"0 0 31 4 *",  // 31 April
+		"0 0 31 6 *",  // 31 June
+		"0 0 31 9 *",  // 31 September
+		"0 0 31 11 *", // 31 November
+	} {
+		t.Run(spec, func(t *testing.T) {
+			sched, err := Parse(spec)
+			if err == nil {
+				t.Fatalf("Parse(%q) returned no error; this date never occurs", spec)
+			}
+			if sched != nil {
+				t.Errorf("Parse(%q) returned a schedule alongside an error", spec)
+			}
+			// An operator reading this has to understand it is the date, not the syntax.
+			if !strings.Contains(err.Error(), "can never fire") {
+				t.Errorf("error should say the schedule can never fire, got: %v", err)
+			}
+		})
+	}
+}
+
+// 29 February is the near miss: rare, not impossible. It is the case a naive
+// "that date looks odd" check gets wrong, and rejecting it would break anyone
+// snapshotting on a leap day.
+func TestParse_LeapDayIsAccepted(t *testing.T) {
+	sched, err := Parse("0 0 29 2 *")
+	if err != nil {
+		t.Fatalf("29 February must be accepted: %v", err)
+	}
+	from := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	want := time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)
+	if got := sched.Next(from); !got.Equal(want) {
+		t.Errorf("next tick = %v, want %v", got, want)
+	}
+}
+
+// The guard must claim those six and nothing else. Sweeping the whole space is
+// what proves the fixed reference instant decides correctly — a spot check
+// could not tell it apart from a rule that is merely close.
+func TestParse_RejectsExactlyTheImpossibleDates(t *testing.T) {
+	impossible := map[string]bool{
+		"0 0 30 2": true, "0 0 31 2": true, "0 0 31 4": true,
+		"0 0 31 6": true, "0 0 31 9": true, "0 0 31 11": true,
+	}
+	var rejected int
+	for dom := 1; dom <= 31; dom++ {
+		for mon := 1; mon <= 12; mon++ {
+			for dow := 0; dow <= 7; dow++ {
+				spec := fmt.Sprintf("0 0 %d %d *", dom, mon)
+				if dow < 7 {
+					spec = fmt.Sprintf("0 0 %d %d %d", dom, mon, dow)
+				}
+				_, err := Parse(spec)
+				// A day-of-week restriction makes the date reachable again:
+				// cron ORs day-of-month and day-of-week when both are set.
+				want := impossible[fmt.Sprintf("0 0 %d %d", dom, mon)] && dow == 7
+				if got := err != nil; got != want {
+					t.Errorf("Parse(%q): rejected=%v, want %v (err=%v)", spec, got, want, err)
+				}
+				if err != nil {
+					rejected++
+				}
+			}
+		}
+	}
+	if rejected != len(impossible) {
+		t.Errorf("rejected %d expressions, want exactly %d", rejected, len(impossible))
 	}
 }

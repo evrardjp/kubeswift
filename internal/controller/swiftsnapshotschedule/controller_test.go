@@ -427,3 +427,68 @@ func TestReconcile_SteadyStateDoesNotRewriteStatus(t *testing.T) {
 			first.ResourceVersion, second.ResourceVersion)
 	}
 }
+
+// A date that never occurs is now rejected at parse time, so it takes the same
+// visible path as a syntax error. Before the guard this schedule created a
+// SwiftSnapshot named "nightly--62135596800" — the zero time in Unix seconds —
+// and put it back one reconcile after an operator deleted it.
+func TestReconcile_ImpossibleDate_SurfacesReadyFalseAndCreatesNothing(t *testing.T) {
+	sched := schedule(func(s *snapshotv1alpha1.SwiftSnapshotSchedule) {
+		s.Spec.Schedule = "0 0 31 4 *" // 31 April
+	})
+	r, c := newSched(t, baseTime, sched)
+	res, err := r.Reconcile(context.Background(), req())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(listSnaps(t, c)); n != 0 {
+		t.Errorf("a schedule that can never fire must create nothing; got %d snapshots", n)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("requeue = %v, want 0 — re-reconciled by its watch when the spec is fixed", res.RequeueAfter)
+	}
+	cond := readyCond(t, c)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "InvalidSchedule" {
+		t.Fatalf("Ready condition = %+v, want False/InvalidSchedule", cond)
+	}
+	if !strings.Contains(cond.Message, "can never fire") {
+		t.Errorf("message must tell the operator the date is the problem, got %q", cond.Message)
+	}
+}
+
+// leapDayPastHorizon returns a schedule and a "now" where cron finds no next
+// occurrence: 29 February from 2097, since 2100 is not a leap year and 2104 is
+// past the five years cron looks ahead.
+//
+// Parse cannot screen this out — the expression is valid and does fire at other
+// times — which is why the reconcile loop guards the zero time itself.
+func leapDayPastHorizon(t *testing.T) (cron.Schedule, time.Time) {
+	t.Helper()
+	sched, err := parseScheduleUTC("0 0 29 2 *")
+	if err != nil {
+		t.Fatalf("29 February must parse: %v", err)
+	}
+	now := time.Date(2097, 3, 1, 0, 0, 0, 0, time.UTC)
+	if !sched.Next(now).IsZero() {
+		t.Fatal("precondition failed: cron found an occurrence, so this no longer tests the zero-time path")
+	}
+	return sched, now
+}
+
+// Without the check the wait is a vast negative that clamps to one second, and
+// the reconciler spins for the lifetime of the object.
+func TestRequeueToNext_NoOccurrenceBacksOff(t *testing.T) {
+	sched, now := leapDayPastHorizon(t)
+	if got := requeueToNext(sched, now); got != maxRequeue {
+		t.Errorf("requeue = %v, want %v (nothing to wait for)", got, maxRequeue)
+	}
+}
+
+// The zero time precedes every "now", so unguarded it reads as permanently due.
+func TestMostRecentDue_NoOccurrenceIsNotDue(t *testing.T) {
+	sched, now := leapDayPastHorizon(t)
+	tick, due := mostRecentDue(sched, now.Add(-24*time.Hour), now)
+	if due {
+		t.Errorf("due = true (tick %v); no occurrence exists, so nothing is due", tick)
+	}
+}
